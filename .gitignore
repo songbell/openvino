@@ -69,3 +69,4 @@ ngraph/src/ngraphConfigVersion.cmake
 ngraph/src/protobuf/
 ngraph/src/src/
 ngraph/src/test/
+patch_since_ov_release_2021_3.diff

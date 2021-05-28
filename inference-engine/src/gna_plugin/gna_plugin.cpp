@@ -50,7 +50,7 @@
 #include <transformations/init_node_info.hpp>
 #include <transformations/opset_conversions/convert_opset3_to_opset2.hpp>
 #include <transformations/opset_conversions/convert_opset2_to_opset1.hpp>
-
+#include <transformations/common_optimizations/algebraic_simplification.hpp>
 #if GNA_LIB_VER == 2
 #include <gna2-model-api.h>
 
@@ -698,6 +698,7 @@ void GNAPlugin::LoadNetwork(CNNNetwork & _network) {
                     // UnrollTI transformation is disabled by default, is turned on by LowLatency transformation
                     return node->get_rt_info().count("UNROLL_TI") == 0;
             });
+        pass_config->disable<ngraph::pass::AlgebraicSimplification>();
         manager.run_passes(graph);
         convertedNetwork = InferenceEngine::details::convertFunctionToICNNNetwork(graph, clonedNetwork);
     }
