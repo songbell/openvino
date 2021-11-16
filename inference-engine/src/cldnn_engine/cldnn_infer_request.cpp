@@ -45,7 +45,44 @@ void copyToFloat(float* dst, const InferenceEngine::Blob* src) {
     for (size_t i = 0; i < t_blob->size(); i++)
         dst[i] = srcPtr[i];
 }
+template<typename T>
+void printResultActual(Blob::Ptr dst) {
+    auto locked_dst = dst->buffer();
+    auto dst_ptr = locked_dst.as<T*>();
+    if (dst_ptr == nullptr) {
+        IE_THROW() << "Invalid output blob";
+    }
+    std::cout << "buffer size as " << dst->size() << std::endl;
+    for (size_t i = 0; i < dst->size(); i++) {
+       std::cout << dst_ptr[i] << " ";
+    }
+    std::cout << std::endl;
+}
 
+void printResult(Blob::Ptr dst) {
+    switch (dst->getTensorDesc().getPrecision()) {
+    case Precision::FP32: printResultActual<float>(dst);    break;
+    case Precision::FP16: printResultActual<uint16_t>(dst); break;
+    case Precision::I32:  printResultActual<int32_t>(dst);  break;
+    case Precision::I64:  printResultActual<int64_t>(dst);  break;
+    case Precision::U8:  printResultActual<uint8_t>(dst);  break;
+    case Precision::I8:  printResultActual<int8_t>(dst);  break;
+    default: IE_THROW(NotImplemented) << "The plugin does not support output " << dst->getTensorDesc().getPrecision() << " precision";
+    }
+}
+
+/*
+template<typename T>
+void printCLMem(cldnn::memory::ptr src, cldnn::stream& stream)
+{
+    cldnn::mem_lock<T> src_lock{ src, stream };
+    T* src_ptr = src_lock.data();
+
+    for (size_t i = 0; i < src->size(); i++) {
+            std::cout << src_ptr[i];
+        }
+    std::cout << std::endl;
+}*/
 template<typename T>
 void copyResultToOutputBlob(cldnn::memory::ptr src, Blob::Ptr dst, CLDNNPlugin::buf_info* bi, cldnn::stream& stream) {
     size_t n = (bi == nullptr) ? dst->size() : bi->buf_size;
@@ -563,12 +600,14 @@ void CLDNNInferRequest::wait() {
         Blob::Ptr bptr = _outputs[no.first];
         std::string outputID = outputsMap.at(no.first);
         auto outputMemory = internal_outputs.at(outputID).get_memory();
-
+        std::cout << no.first << std::endl;
+        //printResult(bptr);
         // mapping remote blobs not needed -
         // let the user take care of them explicitly
-        if (!bptr->is<gpu::ClBlob>()) {
+      if (!bptr->is<gpu::ClBlob>()) {
             copy_output_data(outputMemory, bptr);
         }
+    printResult(bptr);
     }
 
     // finally collect profiling info

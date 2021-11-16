@@ -368,8 +368,8 @@ int main(int argc, char* argv[]) {
                 }
             }
         }
-
-        for (auto&& item : config) {
+        
+	for (auto&& item : config) {
             ie.SetConfig(item.second, item.first);
         }
 
@@ -490,7 +490,7 @@ int main(int argc, char* argv[]) {
             // --------------------------------------------------------
             next_step();
             startTime = Time::now();
-            exeNetwork = ie.LoadNetwork(cnnNetwork, device_name);
+            exeNetwork = ie.LoadNetwork(cnnNetwork, device_name, {{CONFIG_KEY(PERFORMANCE_HINT),CONFIG_VALUE(THROUGHPUT)}});
             duration_ms = double_to_string(get_total_ms_time(startTime));
             slog::info << "Load network took " << duration_ms << " ms" << slog::endl;
             if (statistics)
@@ -507,7 +507,7 @@ int main(int argc, char* argv[]) {
             // --------------------------------------------------------
             next_step();
             auto startTime = Time::now();
-            exeNetwork = ie.ImportNetwork(FLAGS_m, device_name, {});
+            exeNetwork = ie.ImportNetwork(FLAGS_m, device_name, {{CONFIG_KEY(PERFORMANCE_HINT),CONFIG_VALUE(THROUGHPUT)}});
             auto duration_ms = double_to_string(get_total_ms_time(startTime));
             slog::info << "Import network took " << duration_ms << " ms" << slog::endl;
             if (statistics)
@@ -670,11 +670,9 @@ int main(int argc, char* argv[]) {
         if (!inferRequest) {
             IE_THROW() << "No idle Infer Requests!";
         }
-        if (FLAGS_api == "sync") {
+
             inferRequest->infer();
-        } else {
-            inferRequest->startAsync();
-        }
+
         inferRequestsQueue.waitAll();
         auto duration_ms = double_to_string(inferRequestsQueue.getLatencies()[0]);
         slog::info << "First inference took " << duration_ms << " ms" << slog::endl;
@@ -690,7 +688,7 @@ int main(int argc, char* argv[]) {
         /** to align number if iterations to guarantee that last infer requests are
          * executed in the same conditions **/
         ProgressBar progressBar(progressBarTotalCount, FLAGS_stream_output, FLAGS_progress);
-
+      //fillBlobs(inputFiles, batchSize, app_inputs_info, inferRequestsQueue.requests);
         while ((niter != 0LL && iteration < niter) ||
                (duration_nanoseconds != 0LL && (uint64_t)execTime < duration_nanoseconds) ||
                (FLAGS_api == "async" && iteration % nireq != 0)) {
