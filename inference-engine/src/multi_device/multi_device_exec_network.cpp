@@ -498,6 +498,7 @@ InferenceEngine::IInferRequestInternal::Ptr MultiDeviceExecutableNetwork::Create
     _numRequestMutex.unlock();
     size_t sum = 0;
     InferenceEngine::SoIInferRequestInternal request_to_share_blobs_with;
+    bool recycle = false;
 
     if (_workModeIsAUTO) {
         if (!_loadContext[CPU].isEnabled && _loadContext[ACTUALDEVICE].isAlready) {
@@ -506,6 +507,7 @@ InferenceEngine::IInferRequestInternal::Ptr MultiDeviceExecutableNetwork::Create
                 request_to_share_blobs_with = dev_requests.at(num)._inferRequest;
             } else {
                 IncreaseWorkers(_loadContext[ACTUALDEVICE], request_to_share_blobs_with);
+                recycle = true;
             }
         } else {
             auto& dev_requests = _workerRequests[_loadContext[CPU].deviceInfo.deviceName];
@@ -513,9 +515,10 @@ InferenceEngine::IInferRequestInternal::Ptr MultiDeviceExecutableNetwork::Create
                 request_to_share_blobs_with = dev_requests.at(num)._inferRequest;
             } else {
                 IncreaseWorkers(_loadContext[CPU], request_to_share_blobs_with);
+                recycle = true;
             }
         }
-        return std::make_shared<MultiDeviceInferRequest>(inputs, outputs, request_to_share_blobs_with);
+        return std::make_shared<MultiDeviceInferRequest>(inputs, outputs, request_to_share_blobs_with, recycle);
     }
 
     // borrowing device-specific blobs from the underlying requests for the device-agnostic, user-facing requests
@@ -538,6 +541,7 @@ InferenceEngine::IInferRequestInternal::Ptr MultiDeviceExecutableNetwork::Create
     _numRequestMutex.unlock();
     size_t sum = 0;
     InferenceEngine::SoIInferRequestInternal request_to_share_blobs_with;
+    bool recycle = false;
 
     if (_workModeIsAUTO) {
         if (!_loadContext[CPU].isEnabled && _loadContext[ACTUALDEVICE].isAlready) {
@@ -546,6 +550,7 @@ InferenceEngine::IInferRequestInternal::Ptr MultiDeviceExecutableNetwork::Create
                 request_to_share_blobs_with = dev_requests.at(num)._inferRequest;
             } else {
                 IncreaseWorkers(_loadContext[ACTUALDEVICE], request_to_share_blobs_with);
+                recycle = true;
             }
         } else {
             auto& dev_requests = _workerRequests[_loadContext[CPU].deviceInfo.deviceName];
@@ -553,9 +558,10 @@ InferenceEngine::IInferRequestInternal::Ptr MultiDeviceExecutableNetwork::Create
                 request_to_share_blobs_with = dev_requests.at(num)._inferRequest;
             } else {
                 IncreaseWorkers(_loadContext[CPU], request_to_share_blobs_with);
+                recycle = true;
             }
         }
-        return std::make_shared<MultiDeviceInferRequest>(networkInputs, networkOutputs, request_to_share_blobs_with);
+        return std::make_shared<MultiDeviceInferRequest>(networkInputs, networkOutputs, request_to_share_blobs_with, recycle);
     }
 
     // borrowing device-specific blobs from the underlying requests for the device-agnostic, user-facing requests

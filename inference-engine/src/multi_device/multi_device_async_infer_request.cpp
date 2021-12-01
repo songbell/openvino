@@ -94,24 +94,21 @@ std::map<std::string, InferenceEngineProfileInfo> MultiDeviceAsyncInferRequest::
 
 MultiDeviceAsyncInferRequest::~MultiDeviceAsyncInferRequest() {
     StopAndWait();
-    --(_multiDeviceExecutableNetwork->_numRequestsCreated);
-    //TODO release the extra idle worker requests
-    if (_multiDeviceExecutableNetwork->_workModeIsAUTO) {
+    //if the auto infer request is shared with optimal workers, no need to do manual release
+    if (_multiDeviceExecutableNetwork->_workModeIsAUTO && _inferRequest->NeedRecycle()) {
         auto* idleRequestsPtr = &(_multiDeviceExecutableNetwork->_idleWorkerRequests);
-        std::vector<MultiDeviceExecutableNetwork::WorkerInferRequest*> tempvec;
         for (auto&& idleWorker : *idleRequestsPtr) {
             MultiDeviceExecutableNetwork::WorkerInferRequest* workerRequestPtr = nullptr;
             while (idleWorker.second.try_pop(workerRequestPtr)) {
-                auto it = std::find(tempvec.begin(), tempvec.end(), workerRequestPtr);
-                if (it != tempvec.end())
-                    break;
-                if (workerRequestPtr != nullptr && workerRequestPtr->_manualyDestory) {
+                //loop until we find the corresponding worker which this auto request shared the blob with, and delete it safely
+                if (workerRequestPtr->_manualyDestory &&
+                   (workerRequestPtr->_inferRequest)._ptr.get() == (_inferRequest->GetBlobSharedRequest())._ptr.get()) {
                     delete workerRequestPtr;
                     workerRequestPtr = nullptr;
                     break;
                 }
+                //otherwise, push back to idle queue, do not touch it to avoid threading issue
                 idleWorker.second.try_push(workerRequestPtr);
-                tempvec.push_back(workerRequestPtr);
             }
         }
     }
