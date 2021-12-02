@@ -64,12 +64,14 @@ MultiDeviceAsyncInferRequest::MultiDeviceAsyncInferRequest(
                         }
                     }
                 }
+                MultiDeviceExecutableNetwork::_thisWorkerInferRequest =  _workerInferRequest;
         }},
         // as the scheduling algo may select any device, this stage accepts the scheduling decision (actual workerRequest)
         // then sets the device-agnostic blobs to the actual (device-specific) request
         {
          /*TaskExecutor*/ _multiDeviceExecutableNetwork, /*task*/ [this] {
                _workerInferRequest = MultiDeviceExecutableNetwork::_thisWorkerInferRequest;
+               _workerInferRequest->_isBinded = true;
                _inferRequest->SetBlobsToAnotherRequest(_workerInferRequest->_inferRequest);
         }},
         // final task in the pipeline:
@@ -79,6 +81,9 @@ MultiDeviceAsyncInferRequest::MultiDeviceAsyncInferRequest(
               }
               if (_needPerfCounters)
                   _perfMap = _workerInferRequest->_inferRequest->GetPerformanceCounts();
+              if (!_workerInferRequest->_isBinded && _workerInferRequest->_isAuto) {
+                  _workerInferRequest = nullptr;
+              }
         }}
     };
 }
@@ -94,23 +99,9 @@ std::map<std::string, InferenceEngineProfileInfo> MultiDeviceAsyncInferRequest::
 
 MultiDeviceAsyncInferRequest::~MultiDeviceAsyncInferRequest() {
     StopAndWait();
-    //if the auto infer request is shared with optimal workers, no need to do manual release
-    if (_multiDeviceExecutableNetwork->_workModeIsAUTO && _inferRequest->NeedRecycle()) {
-        auto* idleRequestsPtr = &(_multiDeviceExecutableNetwork->_idleWorkerRequests);
-        for (auto&& idleWorker : *idleRequestsPtr) {
-            MultiDeviceExecutableNetwork::WorkerInferRequest* workerRequestPtr = nullptr;
-            while (idleWorker.second.try_pop(workerRequestPtr)) {
-                //loop until we find the corresponding worker which this auto request shared the blob with, and delete it safely
-                if (workerRequestPtr->_manualyDestory &&
-                   (workerRequestPtr->_inferRequest)._ptr.get() == (_inferRequest->GetBlobSharedRequest())._ptr.get()) {
-                    delete workerRequestPtr;
-                    workerRequestPtr = nullptr;
-                    break;
-                }
-                //otherwise, push back to idle queue, do not touch it to avoid threading issue
-                idleWorker.second.try_push(workerRequestPtr);
-            }
-        }
+    if (_workerInferRequest && _workerInferRequest->_isAuto && _workerInferRequest->_manuallyDestroy) {
+        delete  _workerInferRequest;
+        _workerInferRequest = nullptr;
     }
 }
 }  // namespace MultiDevicePlugin

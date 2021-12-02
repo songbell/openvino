@@ -140,7 +140,9 @@ public:
         InferenceEngine::SoIInferRequestInternal  _inferRequest;
         InferenceEngine::Task                     _task;
         std::exception_ptr                        _exceptionPtr = nullptr;
-        bool                                      _manualyDestory = false;
+        bool                                      _manuallyDestroy = false;
+        bool                                      _isBinded = false;
+        bool                                      _isAuto = false;
     };
     using NotBusyWorkerRequests = ThreadSafeBoundedQueue<WorkerInferRequest*>;
 
@@ -189,7 +191,7 @@ public:
 
 private:
     void GenerateWorkers(const std::string& device, const InferenceEngine::SoExecutableNetworkInternal& executableNetwork);
-    void IncreaseWorkers(AutoLoadContext& loadcontext, InferenceEngine::SoIInferRequestInternal& request_to_share);
+    void IncreaseWorkers(DeviceInformation deviceinfo);
     void WaitActualNetworkReady() const;
     void WaitFirstNetworkReady();
     static bool RunPipelineTask(InferenceEngine::Task& inferPipelineTask,
