@@ -18,4 +18,9 @@ public:
     MOCK_METHOD((std::vector<DeviceInformation>), ParseMetaDevices,
                 (const std::string&, (const std::map<std::string, std::string>&)), (const, override));
 };
+class MockMultiDeviceLoadNetworkTestPlugin : public MultiDeviceInferencePlugin {
+public:
+    MOCK_METHOD(InferenceEngine::IExecutableNetworkInternal::Ptr, LoadExeNetworkImpl, (const InferenceEngine::CNNNetwork&,
+                (const std::map<std::string, std::string>&)), (override));
+};
 }// namespace MockMultiDevice
