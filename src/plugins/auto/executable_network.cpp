@@ -648,23 +648,25 @@ InferenceEngine::IInferRequestInternal::Ptr MultiDeviceExecutableNetwork::Create
 
 IInferRequestInternal::Ptr MultiDeviceExecutableNetwork::CreateInferRequest() {
     if (_workModeIsAUTO) {
-        if (!_loadContext[CPU].isEnabled && _loadContext[ACTUALDEVICE].isAlready) {
-            LOG_INFO("single device schedule path!!!!");
-            return _schedule->CreateInferRequest();
-        }
+        // try enable multi deivice schedule
+        _schedule->SetExecutableNetworkInternal(std::static_pointer_cast<MultiDeviceExecutableNetwork>(shared_from_this()));
+        _schedule->SetCallBackExecutor(_callbackExecutor);
+        return _schedule->CreateInferRequest();
     }
-    // try enable multi deivice schedule
-    _schedule->SetExecutableNetworkInternal(std::static_pointer_cast<MultiDeviceExecutableNetwork>(shared_from_this()));
-    _schedule->SetCallBackExecutor(_callbackExecutor);
-    return _schedule->CreateInferRequest();
+    IInferRequestInternal::Ptr syncRequestImpl;
+    if (this->_plugin) {
+        const auto& core = _plugin->GetCore();
+        if (core && core->isNewAPI())
+            syncRequestImpl = CreateInferRequestImpl(_parameters, _results);
+    }
 
-    /*if (!syncRequestImpl)
+    if (!syncRequestImpl)
         syncRequestImpl = CreateInferRequestImpl(_networkInputs, _networkOutputs);
     syncRequestImpl->setPointerToExecutableNetworkInternal(shared_from_this());
     return std::make_shared<MultiDeviceAsyncInferRequest>(std::static_pointer_cast<MultiDeviceInferRequest>(syncRequestImpl),
                                                           _needPerfCounters,
                                                           std::static_pointer_cast<MultiDeviceExecutableNetwork>(shared_from_this()),
-                                                          _callbackExecutor);*/
+                                                          _callbackExecutor);
 }
 
 void MultiDeviceExecutableNetwork::SetConfig(const std::map<std::string, InferenceEngine::Parameter> &config) {

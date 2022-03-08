@@ -33,19 +33,17 @@ class MultiDeviceInferencePlugin;
 class Schedule : public std::enable_shared_from_this<Schedule>  {
 public:
     using Ptr = std::shared_ptr<Schedule>;
-    //virtual SetInferRequest(BaseInferRequest* ptr) {};
     Schedule() {}
-    Schedule(InferenceEngine::SoExecutableNetworkInternal exenetwork);
+    Schedule(InferenceEngine::SoExecutableNetworkInternal& exenetwork) { _soExeNetwork = exenetwork; }
 
-    virtual InferenceEngine::IInferRequestInternal::Ptr CreateInferRequest();
-    virtual InferenceEngine::IInferRequestInternal::Ptr CreateInferRequestImpl(InferenceEngine::InputsDataMap networkInputs,
-            InferenceEngine::OutputsDataMap networkOutputs);
-    virtual InferenceEngine::IInferRequestInternal::Ptr CreateInferRequestImpl(const std::vector<std::shared_ptr<const ov::Node>>& inputs,
-            const std::vector<std::shared_ptr<const ov::Node>>& outputs);
-    InferenceEngine::ITaskExecutor::Ptr GetCallbackExe() { return _callbackExecutor; }
-    void SetExecutableNetworkInternal(const InferenceEngine::IExecutableNetworkInternal::Ptr& exeNetwork) { _exeNetwork = exeNetwork; }
-    InferenceEngine::IExecutableNetworkInternal::Ptr& GetExecutableNetworkInternal() { return _exeNetwork;}
+    virtual InferenceEngine::IInferRequestInternal::Ptr CreateInferRequest() {
+        return _soExeNetwork->CreateInferRequest();
+    }
+
     void SetCallBackExecutor(const InferenceEngine::ITaskExecutor::Ptr& callbackexe) {_callbackExecutor = callbackexe; }
+    InferenceEngine::ITaskExecutor::Ptr& GetCallbackExe() { return _callbackExecutor; }
+    void SetExecutableNetworkInternal(const InferenceEngine::IExecutableNetworkInternal::Ptr& exeNetwork) { _exeNetwork = exeNetwork; }
+    InferenceEngine::IExecutableNetworkInternal::Ptr& GetExecutableNetworkInternal() { return _exeNetwork; }
     virtual ~Schedule() = default;
 private:
     InferenceEngine::IExecutableNetworkInternal::Ptr _exeNetwork;
