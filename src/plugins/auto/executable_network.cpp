@@ -301,6 +301,7 @@ MultiDeviceExecutableNetwork::MultiDeviceExecutableNetwork(const std::string&   
         // only one device need to load network, do not need to load it async
         _loadContext[ACTUALDEVICE].task();
         // exenetwork is ready for single device situation
+        LOG_INFO("[AUTOPLUGIN]:single device situation");
         _schedule = std::make_shared<Schedule>(_loadContext[ACTUALDEVICE].executableNetwork);
     }
     WaitFirstNetworkReady();

@@ -46,7 +46,7 @@ public:
     InferenceEngine::ITaskExecutor::Ptr& GetCallbackExe() { return _callbackExecutor; }
     void SetExecutableNetworkInternal(const InferenceEngine::IExecutableNetworkInternal::Ptr& exeNetwork) { _exeNetwork = exeNetwork; }
     InferenceEngine::IExecutableNetworkInternal::Ptr& GetExecutableNetworkInternal() { return _exeNetwork; }
-    virtual ~Schedule() = default;
+    virtual ~Schedule() { _soExeNetwork = {}; }
 private:
     InferenceEngine::IExecutableNetworkInternal::Ptr _exeNetwork;
     InferenceEngine::ITaskExecutor::Ptr _callbackExecutor;
