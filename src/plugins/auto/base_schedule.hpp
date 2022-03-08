@@ -37,7 +37,9 @@ public:
     Schedule(InferenceEngine::SoExecutableNetworkInternal& exenetwork) { _soExeNetwork = exenetwork; }
 
     virtual InferenceEngine::IInferRequestInternal::Ptr CreateInferRequest() {
-        return _soExeNetwork->CreateInferRequest();
+        auto res = _soExeNetwork->CreateInferRequest();
+        res->setPointerToExecutableNetworkInternal(_exeNetwork);
+        return res;
     }
 
     void SetCallBackExecutor(const InferenceEngine::ITaskExecutor::Ptr& callbackexe) {_callbackExecutor = callbackexe; }
