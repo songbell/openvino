@@ -19,7 +19,8 @@
 #include "ie_icore.hpp"
 #include <ie_performance_hints.hpp>
 #include "openvino/runtime/properties.hpp"
-
+#include "base_schedule.hpp"
+#include "auto_schedule.hpp"
 #ifdef  MULTIUNITTEST
 #define MOCKTESTMACRO virtual
 #define MultiDevicePlugin MockMultiDevicePlugin
@@ -30,11 +31,18 @@
 namespace MultiDevicePlugin {
 
 class MultiDeviceInferencePlugin;
-
-using DeviceName = std::string;
+enum class autoScenario {
+    SINGLEDEVICE,
+    MULTIDEVICE,
+    HETERO,
+    DEFAULT = MULTIDEVICE
+};
 using NetworkFuture = std::future<InferenceEngine::SoExecutableNetworkInternal>;
 using NetworkPromise = std::promise<InferenceEngine::SoExecutableNetworkInternal>;
 
+template<typename T>
+using DeviceMap = std::unordered_map<std::string, T>;
+using DeviceName = std::string;
 struct DeviceInformation {
     DeviceName deviceName;
     std::map<std::string, std::string> config;
@@ -74,10 +82,6 @@ enum AutoLoadContextIndex {
      ACTUALDEVICE = 1,
      CONTEXTNUM = 2
 };
-
-template<typename T>
-using DeviceMap = std::unordered_map<DeviceName, T>;
-
 class MultiDeviceExecutableNetwork : public InferenceEngine::ExecutableNetworkThreadSafeDefault,
                                      public InferenceEngine::ITaskExecutor {
 public:
@@ -161,6 +165,7 @@ private:
     bool                                                                _exitFlag = {false};
     const InferenceEngine::CNNNetwork                                   _network;
     int                                                                 _cpuHelpInferCount = 0;
+    Schedule::Ptr                                                       _schedule;
 };
 
 }  // namespace MultiDevicePlugin
