@@ -38,17 +38,17 @@ public:
 
     virtual InferenceEngine::IInferRequestInternal::Ptr CreateInferRequest() {
         auto res = _soExeNetwork->CreateInferRequest();
-        res->setPointerToExecutableNetworkInternal(_exeNetwork);
+        res->setPointerToExecutableNetworkInternal(_exeNetwork.lock());
         return res;
     }
 
     void SetCallBackExecutor(const InferenceEngine::ITaskExecutor::Ptr& callbackexe) {_callbackExecutor = callbackexe; }
     InferenceEngine::ITaskExecutor::Ptr& GetCallbackExe() { return _callbackExecutor; }
     void SetExecutableNetworkInternal(const InferenceEngine::IExecutableNetworkInternal::Ptr& exeNetwork) { _exeNetwork = exeNetwork; }
-    InferenceEngine::IExecutableNetworkInternal::Ptr& GetExecutableNetworkInternal() { return _exeNetwork; }
+    InferenceEngine::IExecutableNetworkInternal::Ptr GetExecutableNetworkInternal() { return _exeNetwork.lock(); }
     virtual ~Schedule() { _soExeNetwork = {}; }
 private:
-    InferenceEngine::IExecutableNetworkInternal::Ptr _exeNetwork;
+    std::weak_ptr<InferenceEngine::IExecutableNetworkInternal> _exeNetwork;
     InferenceEngine::ITaskExecutor::Ptr _callbackExecutor;
     InferenceEngine::SoExecutableNetworkInternal _soExeNetwork;
 };
