@@ -5,14 +5,13 @@
 #pragma once
 
 #include <cpp_interfaces/interface/ie_iplugin_internal.hpp>
-
+#include "ie_icore.hpp"
 #include "backend.hpp"
 #include "template_config.hpp"
 #include "template_executable_network.hpp"
 
 //! [plugin:header]
 namespace TemplatePlugin {
-
 class Plugin : public InferenceEngine::IInferencePlugin {
 public:
     using Ptr = std::shared_ptr<Plugin>;

@@ -746,7 +746,7 @@ Engine::LoadExeNetworkImpl(const InferenceEngine::CNNNetwork &network, const std
                         << "Input image format " << input_precision << " is not supported yet...";
         }
     }
-
+    GetCore()->GetAvailableDevices();
     auto config = orig_config;
 
     CNNNetwork clonedNetwork = InferenceEngine::details::cloneNetwork(network);
@@ -1002,6 +1002,7 @@ QueryNetworkResult Engine::QueryNetwork(const CNNNetwork& network, const std::ma
     QueryNetworkResult res;
 
     WeightsSharing::Ptr fake_w_cache;
+    GetCore()->GetAvailableDevices();
     auto function = network.getFunction();
     if (function != nullptr) {
         std::unordered_set<std::string> originalOps;

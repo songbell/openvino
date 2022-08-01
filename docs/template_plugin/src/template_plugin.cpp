@@ -134,7 +134,8 @@ InferenceEngine::QueryNetworkResult Plugin::QueryNetwork(const InferenceEngine::
 
     Configuration fullConfig{config, _cfg, false};
     auto function = network.getFunction();
-
+    // for debug dlopen only
+    auto deviceList = GetCore()->GetAvailableDevices();
     // 1. First of all we should store initial input operation set
     std::unordered_set<std::string> originalOps;
     std::map<std::string, ngraph::NodeTypeInfo> friendlyNameToType;
