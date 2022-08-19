@@ -54,7 +54,8 @@ static const char target_device_message[] =
     "Default value is CPU. Use \"-d HETERO:<comma-separated_devices_list>\" format to specify "
     "HETERO plugin. "
     "Use \"-d MULTI:<comma-separated_devices_list>\" format to specify MULTI plugin. "
-    "The application looks for a suitable plugin for the specified device.";
+    "The application looks for a suitable plugin for the specified device."
+    "Use \"-d MULTITHREAD:<comma-separated_devices_list>\" format to run threading inference on the device lists. ";
 
 /// @brief message for iterations count
 static const char iterations_count_message[] =
