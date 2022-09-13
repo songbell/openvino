@@ -169,9 +169,11 @@ struct PluginConfig {
                 priority = ov::util::to_string(ov::hint::Priority::LOW);
             _keyConfigMap[ov::hint::model_priority.name()] = priority;
         }
-        _keyConfigMap[PluginConfigParams::KEY_PERFORMANCE_HINT] = _perfHintsConfig.ovPerfHint;
-        _keyConfigMap[PluginConfigParams::KEY_PERFORMANCE_HINT_NUM_REQUESTS] = std::to_string(_perfHintsConfig.ovPerfHintNumRequests);
 
+        if (!_perfHintsConfig.ovPerfHint.empty()) {
+            _keyConfigMap[PluginConfigParams::KEY_PERFORMANCE_HINT] = _perfHintsConfig.ovPerfHint;
+            _keyConfigMap[PluginConfigParams::KEY_PERFORMANCE_HINT_NUM_REQUESTS] = std::to_string(_perfHintsConfig.ovPerfHintNumRequests);
+        }
         _keyConfigMap[ov::device::priorities.name()] = _devicePriority;
 
         if (_disableAutoBatching)
