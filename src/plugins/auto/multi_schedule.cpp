@@ -311,7 +311,7 @@ IInferPtr MultiSchedule::CreateInferRequest() {
         } catch(...) {
             LOG_INFO("query perf hint from passthrough network failed");
         }
-        if (_multiSContext->_batchingDisabled || perfmode != CONFIG_VALUE(THROUGHPUT)) {
+        if (_multiSContext->_batchingDisabled || perfmode != CONFIG_VALUE(THROUGHPUT))
             syncRequestImpl->setPointerToSo(_passthroughExeNet._so);
         } else {
             auto so = _passthroughExeNet._ptr->GetPointerToSo();
