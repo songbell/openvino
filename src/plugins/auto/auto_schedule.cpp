@@ -540,6 +540,23 @@ AutoSchedule::~AutoSchedule() {
     LOG_INFO_TAG("ExecutableNetwork end");
 }
 
+IInferPtr AutoSchedule::CreateInferRequestImpl(
+    const std::vector<std::shared_ptr<const ov::Node>>& inputs,
+    const std::vector<std::shared_ptr<const ov::Node>>& outputs) {
+    SoInfer request_to_share_blobs_with;
+    if (_passthroughExeNet)
+        request_to_share_blobs_with = {_passthroughExeNet->CreateInferRequest(), _passthroughExeNet._so};
+    return std::make_shared<MultiDeviceInferRequest>(inputs, outputs, request_to_share_blobs_with);
+}
+
+IInferPtr AutoSchedule::CreateInferRequestImpl(IE::InputsDataMap networkInputs,
+    IE::OutputsDataMap networkOutputs) {
+    SoInfer request_to_share_blobs_with;
+    if (_passthroughExeNet)
+        request_to_share_blobs_with = {_passthroughExeNet->CreateInferRequest(), _passthroughExeNet._so};
+    return std::make_shared<MultiDeviceInferRequest>(networkInputs, networkOutputs, request_to_share_blobs_with);
+}
+
 IInferPtr AutoSchedule::CreateInferRequest() {
     auto execNetwork = std::dynamic_pointer_cast<AutoExecutableNetwork>(
             _autoSContext->_executableNetwork.lock());

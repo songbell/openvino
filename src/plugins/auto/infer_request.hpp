@@ -32,10 +32,12 @@ public:
     explicit MultiDeviceInferRequest(const InferenceEngine::InputsDataMap&  networkInputs,
                                      const InferenceEngine::OutputsDataMap& networkOutputs,
                                      const InferenceEngine::SoIInferRequestInternal & request_to_share_blobs_with,
+                                     bool isBinded = false,
                                      InferenceEngine::RemoteContext::Ptr ctx = nullptr);
     explicit MultiDeviceInferRequest(const std::vector<std::shared_ptr<const ov::Node>>& inputs,
                                      const std::vector<std::shared_ptr<const ov::Node>>& outputs,
                                      const InferenceEngine::SoIInferRequestInternal & request_to_share_blobs_with,
+                                     bool isBinded = false,
                                      InferenceEngine::RemoteContext::Ptr ctx = nullptr);
     std::map<std::string, InferenceEngine::InferenceEngineProfileInfo> GetPerformanceCounts() const override;
     void InferImpl() override;
@@ -54,6 +56,7 @@ private:
     void CreateInferRequest(const InferenceEngine::SoIInferRequestInternal& request_to_share_blobs_with,
                             InferenceEngine::RemoteContext::Ptr ctx);
     InferenceEngine::SoIInferRequestInternal _sharedRequest;
+    bool _binded;
 };
 
 }  // namespace MultiDevicePlugin

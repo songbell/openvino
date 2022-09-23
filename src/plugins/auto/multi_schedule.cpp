@@ -278,20 +278,48 @@ MultiSchedule::~MultiSchedule() {
 IInferPtr MultiSchedule::CreateInferRequestImpl(
     const std::vector<std::shared_ptr<const ov::Node>>& inputs,
     const std::vector<std::shared_ptr<const ov::Node>>& outputs) {
+    auto num = _numRequestsCreated++;
     SoInfer request_to_share_blobs_with;
+    size_t sum = 0;
     IE::RemoteContext::Ptr ctx = nullptr;
-    if (_passthroughExeNet)
+    if (_passthroughExeNet) {
         request_to_share_blobs_with = {_passthroughExeNet->CreateInferRequest(), _passthroughExeNet._so};
-    return std::make_shared<MultiDeviceInferRequest>(inputs, outputs, request_to_share_blobs_with);
+    } else {
+        // borrowing device-specific blobs from the underlying requests for the device-agnostic, user-facing requests
+        // this allows to potentially save on the data-copy later (if the requests are scheduled in the same order)
+        for (const auto& device : _multiSContext->_devicePrioritiesInitial) {
+            auto& dev_requests = _workerRequests[device.deviceName];
+            if ((num - sum) < dev_requests.size()) {
+                request_to_share_blobs_with = dev_requests.at(num - sum)._inferRequest;
+                break;
+            }
+            sum += dev_requests.size();
+        }
+    }
+    return std::make_shared<MultiDeviceInferRequest>(inputs, outputs, request_to_share_blobs_with, _multiSContext->_bindBuffer);
 }
 
 IInferPtr MultiSchedule::CreateInferRequestImpl(IE::InputsDataMap networkInputs,
     IE::OutputsDataMap networkOutputs) {
+    auto num = _numRequestsCreated++;
     SoInfer request_to_share_blobs_with;
     IE::RemoteContext::Ptr ctx = nullptr;
-    if (_passthroughExeNet)
+    size_t sum = 0;
+    if (_passthroughExeNet) {
         request_to_share_blobs_with = {_passthroughExeNet->CreateInferRequest(), _passthroughExeNet._so};
-    return std::make_shared<MultiDeviceInferRequest>(networkInputs, networkOutputs, request_to_share_blobs_with);
+    } else {
+        // borrowing device-specific blobs from the underlying requests for the device-agnostic, user-facing requests
+        // this allows to potentially save on the data-copy later (if the requests are scheduled in the same order)
+        for (const auto& device : _multiSContext->_devicePrioritiesInitial) {
+            auto& dev_requests = _workerRequests[device.deviceName];
+            if ((num - sum) < dev_requests.size()) {
+                request_to_share_blobs_with = dev_requests.at(num - sum)._inferRequest;
+                break;
+            }
+            sum += dev_requests.size();
+        }
+    }
+    return std::make_shared<MultiDeviceInferRequest>(networkInputs, networkOutputs, request_to_share_blobs_with, _multiSContext->_bindBuffer);
 }
 
 IInferPtr MultiSchedule::CreateInferRequest() {
