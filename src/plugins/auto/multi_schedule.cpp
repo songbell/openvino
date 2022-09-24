@@ -296,7 +296,8 @@ IInferPtr MultiSchedule::CreateInferRequestImpl(
             sum += dev_requests.size();
         }
     }
-    return std::make_shared<MultiDeviceInferRequest>(inputs, outputs, request_to_share_blobs_with, _multiSContext->_bindBuffer);
+    return std::make_shared<MultiDeviceInferRequest>(inputs, outputs, request_to_share_blobs_with,
+                _passthroughExeNet? true : _multiSContext->_bindBuffer);
 }
 
 IInferPtr MultiSchedule::CreateInferRequestImpl(IE::InputsDataMap networkInputs,
@@ -319,7 +320,8 @@ IInferPtr MultiSchedule::CreateInferRequestImpl(IE::InputsDataMap networkInputs,
             sum += dev_requests.size();
         }
     }
-    return std::make_shared<MultiDeviceInferRequest>(networkInputs, networkOutputs, request_to_share_blobs_with, _multiSContext->_bindBuffer);
+    return std::make_shared<MultiDeviceInferRequest>(networkInputs, networkOutputs, request_to_share_blobs_with,
+                _passthroughExeNet? true : _multiSContext->_bindBuffer);
 }
 
 IInferPtr MultiSchedule::CreateInferRequest() {

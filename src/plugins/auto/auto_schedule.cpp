@@ -546,7 +546,8 @@ IInferPtr AutoSchedule::CreateInferRequestImpl(
     SoInfer request_to_share_blobs_with;
     if (_passthroughExeNet)
         request_to_share_blobs_with = {_passthroughExeNet->CreateInferRequest(), _passthroughExeNet._so};
-    return std::make_shared<MultiDeviceInferRequest>(inputs, outputs, request_to_share_blobs_with);
+    return std::make_shared<MultiDeviceInferRequest>(inputs, outputs, request_to_share_blobs_with,
+                _passthroughExeNet? true : false);
 }
 
 IInferPtr AutoSchedule::CreateInferRequestImpl(IE::InputsDataMap networkInputs,
@@ -554,7 +555,8 @@ IInferPtr AutoSchedule::CreateInferRequestImpl(IE::InputsDataMap networkInputs,
     SoInfer request_to_share_blobs_with;
     if (_passthroughExeNet)
         request_to_share_blobs_with = {_passthroughExeNet->CreateInferRequest(), _passthroughExeNet._so};
-    return std::make_shared<MultiDeviceInferRequest>(networkInputs, networkOutputs, request_to_share_blobs_with);
+    return std::make_shared<MultiDeviceInferRequest>(networkInputs, networkOutputs, request_to_share_blobs_with,
+                _passthroughExeNet? true : false);
 }
 
 IInferPtr AutoSchedule::CreateInferRequest() {
