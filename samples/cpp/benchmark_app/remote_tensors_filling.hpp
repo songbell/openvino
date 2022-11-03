@@ -66,4 +66,14 @@ std::map<std::string, ov::TensorVector> get_remote_input_tensors(
 
 std::map<std::string, ov::Tensor> get_remote_output_tensors(const ov::CompiledModel& compiledModel,
                                                             std::map<std::string, ::gpu::BufferType>& clBuffer);
+
+std::map<std::string, ov::TensorVector> get_remote_tensors(
+    ov::Core core,
+    const std::map<std::string, std::vector<std::string>>& inputFiles,
+    const std::vector<benchmark_app::InputsInfo>& app_inputs_info,
+    const ov::CompiledModel& compiledModel,
+    const std::vector<std::string>& hwdevices,
+    std::vector<BufferType>& clBufferIn,
+    size_t num_requests,
+    bool isInput);
 }  // namespace gpu

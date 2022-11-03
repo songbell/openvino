@@ -187,4 +187,99 @@ std::map<std::string, ov::Tensor> get_remote_output_tensors(const ov::CompiledMo
     throw ov::Exception("Device memory requested for GPU device, but OpenCL was not linked");
 #endif
 }
+
+std::map<std::string, ov::TensorVector> get_remote_tensors(
+    ov::Core core,
+    const std::map<std::string, std::vector<std::string>>& inputFiles,
+    const std::vector<benchmark_app::InputsInfo>& app_inputs_info,
+    const ov::CompiledModel& compiledModel,
+    const std::vector<std::string>& hwdevices,
+    std::vector<BufferType>& clBufferIn,
+    size_t num_requests,
+    bool isInput) {
+#ifdef HAVE_DEVICE_MEM_SUPPORT
+    slog::info << "Device memory will be used for input and output blobs" << slog::endl;
+    if (inputFiles.size()) {
+        slog::warn << "Device memory supports only random data at this moment, input images will be ignored"
+                   << slog::endl;
+    }
+
+    std::map<std::string, ov::TensorVector> remoteTensors;
+    int contextNum = 0;
+    for (auto& iter : hwdevices) {
+        try {
+            auto cldnn_context = core.get_default_context(iter).as<ov::intel_gpu::ocl::ClContext>();
+            contextNum++;
+        } catch (...) {
+
+        }
+    }
+    for (auto& iter : hwdevices) {
+        try {
+        auto context = core.get_default_context(iter);
+        auto& oclContext = static_cast<ov::intel_gpu::ocl::ClContext&>(context);
+        auto oclInstance = std::make_shared<gpu::OpenCL>(oclContext);
+
+        for (int i = 0; i < num_requests/contextNum; i++) {
+            for (auto& inputs_info : app_inputs_info) {
+                if (isInput) {
+                    for (auto& input : inputs_info) {
+                        // Fill random
+                        slog::info << "Prepare remote blob for input '" << input.first << "' with random values ("
+                                << std::string((input.second.is_image() ? "image" : "some binary data")) << " is expected)"
+                                << slog::endl;
+
+                        // Creating and filling shared buffers
+                        cl_int err;
+                        auto elementsNum = std::accumulate(begin(input.second.dataShape),
+                                                        end(input.second.dataShape),
+                                                        1,
+                                                        std::multiplies<size_t>());
+                        auto inputSize = elementsNum * input.second.type.bitwidth() / 8;
+
+                        clBufferIn.push_back(
+                            cl::Buffer(oclInstance->_context, CL_MEM_READ_WRITE, (cl::size_type)inputSize, NULL, &err));
+
+                        void* mappedPtr = oclInstance->_queue.enqueueMapBuffer(clBufferIn.back(),
+                                                                            CL_TRUE,
+                                                                            CL_MEM_READ_WRITE,
+                                                                            0,
+                                                                            (cl::size_type)inputSize);
+
+                        auto tensor =
+                            oclContext.create_tensor(input.second.type, input.second.dataShape, clBufferIn.back().get());
+                        remoteTensors[input.first].push_back(tensor);
+
+                        if (inputFiles.empty()) {
+                            // Filling in random data
+                            fill_buffer(mappedPtr, elementsNum, input.second.type);
+                        } else {
+                            // TODO: add filling with real image data
+                        }
+                        oclInstance->_queue.enqueueUnmapMemObject(clBufferIn.back(), mappedPtr);
+                    }
+                } else {
+                    std::map<std::string, ::gpu::BufferType> clBufferOut;
+                    for (auto& output : compiledModel.outputs()) {
+                        ov::Shape shape = get_static_shape(output);
+                        cl_int err;
+                        auto elementsNum = shape_size(shape);
+                        auto inputSize = elementsNum * output.get_element_type().bitwidth() / 8;
+                        clBufferOut[output.get_any_name()] =
+                            cl::Buffer(oclInstance->_context, CL_MEM_READ_WRITE, (cl::size_type)inputSize, NULL, &err);
+                        auto tensor = oclContext.create_tensor(output.get_element_type(), shape, clBufferOut[output.get_any_name()].get());
+                        remoteTensors[output.get_any_name()].push_back(tensor);
+                    }
+                }
+            }
+        }
+        } catch (...) {
+            // hw not support remote context
+        }
+    }
+    return remoteTensors;
+#else
+    throw ov::Exception("Device memory requested for GPU device, but OpenCL was not linked");
+#endif
+}
 }  // namespace gpu
