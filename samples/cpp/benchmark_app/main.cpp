@@ -921,6 +921,7 @@ int main(int argc, char* argv[]) {
         bool useGpuMem = false;
 
         std::map<std::string, ov::TensorVector> inputsData;
+        std::map<std::string, ov::TensorVector> outputsData;
         if (isFlagSetInCommandLine("use_device_mem")) {
             if (device_name.find("GPU") == 0) {
                 inputsData = ::gpu::get_remote_input_tensors(inputFiles,
@@ -947,6 +948,13 @@ int main(int argc, char* argv[]) {
                                                              clInputsBuffer,
                                                              inferRequestsQueue.requests.size(),
                                                              true);
+                outputsData = ::gpu::get_remote_tensors(core, inputFiles,
+                                            app_inputs_info,
+                                            compiledModel,
+                                            hardware_devices,
+                                            clInputsBuffer,
+                                            inferRequestsQueue.requests.size(),
+                                            false);
                 useGpuMem = true;
             } else {
                 throw ov::Exception("Requested device doesn't support `use_device_mem` option.");
@@ -1016,13 +1024,7 @@ int main(int argc, char* argv[]) {
             if (nireq < inputsData.begin()->second.size())
                 slog::warn << "Only " << nireq << " test configs will be used." << slog::endl;
             size_t i = 0;
-            auto outputsData = ::gpu::get_remote_tensors(core, inputFiles,
-                                            app_inputs_info,
-                                            compiledModel,
-                                            hardware_devices,
-                                            clInputsBuffer,
-                                            inferRequestsQueue.requests.size(),
-                                            false);
+
             for (auto& inferRequest : inferRequestsQueue.requests) {
                 auto inputs = app_inputs_info[i % app_inputs_info.size()];
                 for (auto& item : inputs) {

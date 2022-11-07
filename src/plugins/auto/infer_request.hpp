@@ -49,11 +49,13 @@ public:
     void SetBlobsToAnotherRequest(const InferenceEngine::SoIInferRequestInternal& req);
     InferenceEngine::SoIInferRequestInternal& GetSharedRequest() { return _sharedRequest; }
     InferenceEngine::SoIInferRequestInternal _scheduledRequest;
+    std::string getPreferredDeviceName () { return _preferredDeviceName; }
 
 private:
     void CreateInferRequest(const InferenceEngine::SoIInferRequestInternal& request_to_share_blobs_with,
                             InferenceEngine::RemoteContext::Ptr ctx);
     InferenceEngine::SoIInferRequestInternal _sharedRequest;
+    std::string _preferredDeviceName;
 };
 
 }  // namespace MultiDevicePlugin

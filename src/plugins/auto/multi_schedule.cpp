@@ -66,7 +66,7 @@ Pipeline MultiSchedule::GetPipeline(const IInferPtr& syncInferRequest, WorkerInf
                         auto b = syncInferRequest->GetBlob(it.first);
                         auto r = b->as<IE::RemoteBlob>();
                         if (r) {
-                            const auto name = r->getDeviceName();
+                            const auto name = std::dynamic_pointer_cast<MultiDeviceInferRequest>(syncInferRequest)->getPreferredDeviceName();
                             const auto res = std::find_if(
                                 _multiSContext->_devicePrioritiesInitial.cbegin(),
                                 _multiSContext->_devicePrioritiesInitial.cend(),

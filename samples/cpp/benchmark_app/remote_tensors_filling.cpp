@@ -220,7 +220,7 @@ std::map<std::string, ov::TensorVector> get_remote_tensors(
         auto& oclContext = static_cast<ov::intel_gpu::ocl::ClContext&>(context);
         auto oclInstance = std::make_shared<gpu::OpenCL>(oclContext);
 
-        for (int i = 0; i < num_requests/contextNum; i++) {
+        for (int i = 0; i < std::ceil(num_requests/contextNum); i++) {
             for (auto& inputs_info : app_inputs_info) {
                 if (isInput) {
                     for (auto& input : inputs_info) {
@@ -264,9 +264,9 @@ std::map<std::string, ov::TensorVector> get_remote_tensors(
                         ov::Shape shape = get_static_shape(output);
                         cl_int err;
                         auto elementsNum = shape_size(shape);
-                        auto inputSize = elementsNum * output.get_element_type().bitwidth() / 8;
+                        auto outputSize = elementsNum * output.get_element_type().bitwidth() / 8;
                         clBufferOut[output.get_any_name()] =
-                            cl::Buffer(oclInstance->_context, CL_MEM_READ_WRITE, (cl::size_type)inputSize, NULL, &err);
+                            cl::Buffer(oclInstance->_context, CL_MEM_READ_WRITE, (cl::size_type)outputSize, NULL, &err);
                         auto tensor = oclContext.create_tensor(output.get_element_type(), shape, clBufferOut[output.get_any_name()].get());
                         remoteTensors[output.get_any_name()].push_back(tensor);
                     }

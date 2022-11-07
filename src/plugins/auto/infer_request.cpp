@@ -85,17 +85,24 @@ void MultiDeviceInferRequest::SetBlobsToAnotherRequest(const SoIInferRequestInte
 }
 
 void MultiDeviceInferRequest::SetBlob(const std::string& name, const InferenceEngine::Blob::Ptr& blob) {
-    if (_sharedRequest)
+    if (_sharedRequest) {
         _sharedRequest->SetBlob(name, blob);
-    else
+    } else {
+        // getDeviceName will cause big latency, see CVS-95924
+        if (blob->as<InferenceEngine::RemoteBlob>())
+            _preferredDeviceName = (blob->as<InferenceEngine::RemoteBlob>())->getDeviceName();
         IInferRequestInternal::SetBlob(name, blob);
+    }
 }
 
 void MultiDeviceInferRequest::SetBlob(const std::string& name, const Blob::Ptr& blob, const PreProcessInfo& info) {
-    if (_sharedRequest)
+    if (_sharedRequest) {
         _sharedRequest->SetBlob(name, blob, info);
-    else
+    } else {
+        if (blob->as<InferenceEngine::RemoteBlob>())
+            _preferredDeviceName = (blob->as<InferenceEngine::RemoteBlob>())->getDeviceName();
         IInferRequestInternal::SetBlob(name, blob, info);
+    }
 }
 
 InferenceEngine::Blob::Ptr MultiDeviceInferRequest::GetBlob(const std::string& name) {
