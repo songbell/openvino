@@ -941,20 +941,22 @@ int main(int argc, char* argv[]) {
                         nireq);
                 }
             } else if (if_auto || if_multi) {
-                inputsData = ::gpu::get_remote_tensors(core, inputFiles,
-                                                             app_inputs_info,
-                                                             compiledModel,
-                                                             hardware_devices,
-                                                             clInputsBuffer,
-                                                             inferRequestsQueue.requests.size(),
-                                                             true);
-                outputsData = ::gpu::get_remote_tensors(core, inputFiles,
-                                            app_inputs_info,
-                                            compiledModel,
-                                            hardware_devices,
-                                            clInputsBuffer,
-                                            inferRequestsQueue.requests.size(),
-                                            false);
+                inputsData = ::gpu::get_remote_tensors(core,
+                                                       inputFiles,
+                                                       app_inputs_info,
+                                                       compiledModel,
+                                                       hardware_devices,
+                                                       clInputsBuffer,
+                                                       inferRequestsQueue.requests.size(),
+                                                       true);
+                outputsData = ::gpu::get_remote_tensors(core,
+                                                        inputFiles,
+                                                        app_inputs_info,
+                                                        compiledModel,
+                                                        hardware_devices,
+                                                        clInputsBuffer,
+                                                        inferRequestsQueue.requests.size(),
+                                                        false);
                 useGpuMem = true;
             } else {
                 throw ov::Exception("Requested device doesn't support `use_device_mem` option.");
@@ -1045,7 +1047,8 @@ int main(int argc, char* argv[]) {
                 if (useGpuMem) {
                     if (if_auto || if_multi) {
                         for (auto& output : compiledModel.outputs()) {
-                            const auto& outputTensor = outputsData.at(output.get_any_name())[i % outputsData.at(output.get_any_name()).size()];
+                            const auto& outputTensor =
+                                outputsData.at(output.get_any_name())[i % outputsData.at(output.get_any_name()).size()];
                             inferRequest->set_tensor(output.get_any_name(), outputTensor);
                         }
                     } else {
