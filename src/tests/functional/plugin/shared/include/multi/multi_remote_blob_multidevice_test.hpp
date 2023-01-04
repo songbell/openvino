@@ -23,7 +23,8 @@ TEST_P(MultiDeviceMultipleGPU_Test, canCreateRemoteTensorThenInferWithAffinity) 
     auto function = p.build();
     ov::CompiledModel exec_net;
     try {
-        exec_net = ie.compile_model(function, device_names, ov::hint::allow_auto_batching(false));
+        exec_net = ie.compile_model(function, device_names, {ov::hint::allow_auto_batching(false),
+            ov::hint::performance_mode(ov::hint::PerformanceMode::UNDEFINED)});
     } catch (...) {
         // device is unavailable (e.g. for the "second GPU" test) or other (e.g. env) issues not related to the test
         return;
@@ -38,10 +39,12 @@ TEST_P(MultiDeviceMultipleGPU_Test, canCreateRemoteTensorThenInferWithAffinity) 
     inf_req_regular.infer();
     auto output_tensor_regular = inf_req_regular.get_tensor(output);
     auto imSize = ov::shape_size(input->get_shape());
+    std::vector<ov::intel_gpu::ocl::ClContext> contexts = {};
     std::vector<ov::intel_gpu::ocl::ClBufferTensor> cldnn_tensor = {};
     for (auto& iter : device_lists) {
         try {
             auto cldnn_context = ie.get_default_context(iter).as<ov::intel_gpu::ocl::ClContext>();
+            contexts.push_back(cldnn_context);
             cl_context ctx = cldnn_context;
             auto ocl_instance = std::make_shared<OpenCL>(ctx);
             cl_int err;
@@ -78,5 +81,69 @@ TEST_P(MultiDeviceMultipleGPU_Test, canCreateRemoteTensorThenInferWithAffinity) 
             ASSERT_NO_THROW(output_tensor_shared.data());
             FuncTestUtils::compare_tensor(output_tensor_regular, output_tensor_shared, thr);
         }
+    }
+}
+
+TEST_P(MultiDeviceMultipleGPU_Test, canInferOnUserContextWithMultiPlugin) {
+    auto ie = ov::Core();
+
+    using namespace ov::preprocess;
+    auto p = PrePostProcessor(fn_ptr);
+    p.input().tensor().set_element_type(ov::element::i8);
+    p.input().preprocess().convert_element_type(ov::element::f32);
+    auto function = p.build();
+    ov::CompiledModel exec_net_regular;
+    try {
+        exec_net_regular = ie.compile_model(function, device_names);
+    } catch (...) {
+        // device is unavailable (e.g. for the "second GPU" test) or other (e.g. env) issues not related to the test
+        return;
+    }
+    auto input = function->get_parameters().at(0);
+    auto output = function->get_results().at(0);
+
+    // regular inference
+    auto inf_req_regular = exec_net_regular.create_infer_request();
+    auto fakeImageData = FuncTestUtils::create_and_fill_tensor(input->get_element_type(), input->get_shape());
+    inf_req_regular.set_tensor(input, fakeImageData);
+
+    inf_req_regular.infer();
+    auto output_tensor_regular = inf_req_regular.get_tensor(exec_net_regular.output());
+
+    // inference using remote tensor
+    std::vector<std::shared_ptr<OpenCL>> ocl_instances;
+    std::vector<cl::Device> devices;
+    for (int i = 0; i < device_lists.size(); i++) {
+        auto ocl_instance_tmp = std::make_shared<OpenCL>(i);
+        ocl_instances.push_back(ocl_instance_tmp);
+        devices.push_back(ocl_instances.back()->_device);
+    }
+    cl::Context multi_device_ctx(devices);
+    auto ocl_instance = std::make_shared<OpenCL>(multi_device_ctx.get());
+    std::vector<ov::RemoteContext> remote_contexts;
+    for (int i = 0; i < device_lists.size(); i++) {
+        auto remote_context = ov::intel_gpu::ocl::ClContext(ie, ocl_instance->_context.get(), i);
+        remote_contexts.push_back(remote_context);
+    }
+    ov::AnyMap context_list;
+    for (auto& iter : remote_contexts) {
+        context_list.insert({iter.get_device_name(), iter});
+    }
+    auto multi_context = ie.create_context("MULTI", context_list);
+    auto exec_net_shared = ie.compile_model(function, multi_context, config);
+    auto inf_req_shared = exec_net_shared.create_infer_request();
+    inf_req_shared.set_tensor(input, fakeImageData);
+
+    inf_req_shared.infer();
+    auto output_tensor_shared = inf_req_shared.get_tensor(output);
+
+    // compare results
+    {
+        ASSERT_EQ(output->get_element_type(), ov::element::f32);
+        ASSERT_EQ(output_tensor_regular.get_size(), output_tensor_shared.get_size());
+        auto thr = FuncTestUtils::GetComparisonThreshold(InferenceEngine::Precision::FP32);
+        ASSERT_NO_THROW(output_tensor_regular.data());
+        ASSERT_NO_THROW(output_tensor_shared.data());
+        FuncTestUtils::compare_tensor(output_tensor_regular, output_tensor_shared, thr);
     }
 }

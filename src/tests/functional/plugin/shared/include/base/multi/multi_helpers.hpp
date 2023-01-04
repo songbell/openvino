@@ -63,6 +63,12 @@ class MultiDeviceMultipleGPU_Test : public CommonTestUtils::TestsCommon, public 
         device_names = getDeviceStringWithMulti(this->GetParam());
         device_lists = this->GetParam();
         fn_ptr = ov::test::behavior::getDefaultNGraphFunctionForTheDevice("");
+        std::string prioritylist;
+        for (auto && device : device_lists) {
+            prioritylist += device;
+            prioritylist += ((device == device_lists[device_lists.size()-1]) ? "" : ",");
+        }
+        config = {ov::device::priorities(prioritylist)};
     }
 public:
     static std::string getTestCaseName(const testing::TestParamInfo<DevicesNames> &obj) {
@@ -74,6 +80,7 @@ protected:
     std::string device_names;
     std::vector<std::string> device_lists;
     std::shared_ptr<ngraph::Function> fn_ptr;
+    ov::AnyMap config;
 };
 #define MULTI  CommonTestUtils::DEVICE_MULTI
 #define CPU    CommonTestUtils::DEVICE_CPU
