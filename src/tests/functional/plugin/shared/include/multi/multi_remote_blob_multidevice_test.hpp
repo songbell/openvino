@@ -10,17 +10,10 @@
 #include "openvino/runtime/intel_gpu/ocl/ocl.hpp"
 #include "openvino/runtime/core.hpp"
 #include "openvino/runtime/properties.hpp"
-#include "openvino/core/preprocess/pre_post_process.hpp"
 #include <remote_blob_tests/remote_blob_helpers.hpp>
 
-TEST_P(MultiDeviceMultipleGPU_Test, canCreateRemoteTensorThenInferWithAffinity) {
+TEST_P(MultiDeviceMultipleGPU_Test, canInferOnDefaultContext) {
     auto ie = ov::Core();
-    using namespace ov::preprocess;
-    auto p = PrePostProcessor(fn_ptr);
-    p.input().tensor().set_element_type(ov::element::i8);
-    p.input().preprocess().convert_element_type(ov::element::f32);
-
-    auto function = p.build();
     ov::CompiledModel exec_net;
     try {
         exec_net = ie.compile_model(function, device_names, {ov::hint::allow_auto_batching(false),
@@ -84,14 +77,8 @@ TEST_P(MultiDeviceMultipleGPU_Test, canCreateRemoteTensorThenInferWithAffinity) 
     }
 }
 
-TEST_P(MultiDeviceMultipleGPU_Test, canInferOnUserContextWithMultiPlugin) {
+TEST_P(MultiDeviceCreateContextMultipleGPU_Test, canInferOnUserContextWithSystemMemory) {
     auto ie = ov::Core();
-
-    using namespace ov::preprocess;
-    auto p = PrePostProcessor(fn_ptr);
-    p.input().tensor().set_element_type(ov::element::i8);
-    p.input().preprocess().convert_element_type(ov::element::f32);
-    auto function = p.build();
     ov::CompiledModel exec_net_regular;
     try {
         exec_net_regular = ie.compile_model(function, device_names);
@@ -145,5 +132,104 @@ TEST_P(MultiDeviceMultipleGPU_Test, canInferOnUserContextWithMultiPlugin) {
         ASSERT_NO_THROW(output_tensor_regular.data());
         ASSERT_NO_THROW(output_tensor_shared.data());
         FuncTestUtils::compare_tensor(output_tensor_regular, output_tensor_shared, thr);
+    }
+}
+
+TEST_P(MultiDeviceCreateContextMultipleGPU_Test, canInferOnUserContextWithRemoteMemory) {
+    auto ie = ov::Core();
+    ov::CompiledModel exec_net_regular;
+    try {
+        exec_net_regular = ie.compile_model(function, device_names);
+    } catch (...) {
+        // device is unavailable (e.g. for the "second GPU" test) or other (e.g. env) issues not related to the test
+        return;
+    }
+    auto input = function->get_parameters().at(0);
+    auto output = function->get_results().at(0);
+
+    // regular inference
+    auto inf_req_regular = exec_net_regular.create_infer_request();
+    auto fakeImageData = FuncTestUtils::create_and_fill_tensor(input->get_element_type(), input->get_shape());
+    inf_req_regular.set_tensor(input, fakeImageData);
+
+    inf_req_regular.infer();
+    auto output_tensor_regular = inf_req_regular.get_tensor(exec_net_regular.output());
+
+    // inference using remote tensor
+    // get the input/output size
+    auto in_size = ov::shape_size(input->get_output_shape(0)) * input->get_output_element_type(0).size();
+    auto out_size = ov::shape_size(output->get_output_shape(0)) * output->get_output_element_type(0).size();
+
+    std::vector<std::shared_ptr<OpenCL>> ocl_instances;
+    std::vector<ov::RemoteContext> remote_contexts;
+    // construcing seprarate GPU contexts
+    for (int i = 0; i < device_lists.size(); i++) {
+        auto ocl_instance_tmp = std::make_shared<OpenCL>(i);
+        ocl_instances.push_back(ocl_instance_tmp);
+        auto remote_context = ov::intel_gpu::ocl::ClContext(ie, ocl_instances[i]->_context.get());
+        ASSERT_EQ(remote_context.get_device_name(), device_lists[i]);
+        remote_contexts.push_back(remote_context);
+    }
+
+    // creating multi remote context
+    ov::AnyMap context_list;
+    for (auto& iter : remote_contexts) {
+        context_list.insert({iter.get_device_name(), iter});
+    }
+
+    auto multi_context = ie.create_context("MULTI", context_list);
+    // load to MULTI with multi remote context
+
+    auto exec_net_context = ie.compile_model(function, multi_context, config);
+
+    auto num_request = device_lists.size();
+    std::vector<ov::InferRequest> inf_req_context(num_request);
+    std::generate(inf_req_context.begin(), inf_req_context.end(), [&] {
+        return exec_net_context.create_infer_request();
+    });
+
+    std::vector<cl::Buffer> share_input_buffers(num_request);
+    std::vector<cl::Buffer> share_output_buffers(num_request);
+    std::vector<ov::Tensor> gpu_in_tensors(num_request);
+    std::vector<ov::Tensor> gpu_out_tensors(num_request);
+    std::vector<ov::Tensor> out_tensors(num_request);
+    std::generate(out_tensors.begin(), out_tensors.end(), [&] {
+        return FuncTestUtils::create_and_fill_tensor(output->get_output_element_type(0), output->get_output_shape(0));
+    });
+    // Fill input data for ireqs
+    cl_int err;
+    for (int i = 0; i < num_request; i++) {
+        // Allocate shared buffers for input and output data which will be set to infer request
+        share_input_buffers[i] = cl::Buffer(ocl_instances[i]->_context, CL_MEM_READ_WRITE, in_size, NULL, &err);
+        share_output_buffers[i] = cl::Buffer(ocl_instances[i]->_context, CL_MEM_READ_WRITE, out_size, NULL, &err);
+        auto temp_context = remote_contexts[i].as<ov::intel_gpu::ocl::ClContext>();
+        gpu_in_tensors[i] = temp_context.create_tensor(input->get_output_element_type(0), input->get_output_shape(0), share_input_buffers[i]);
+        gpu_out_tensors[i] = temp_context.create_tensor(output->get_output_element_type(0), output->get_output_shape(0), share_output_buffers[i]);
+        inf_req_context[i].set_tensor(input, gpu_in_tensors[i]);
+        inf_req_context[i].set_tensor(output, gpu_out_tensors[i]);
+        void* buffer = fakeImageData.data();
+        ocl_instances[i]->_queue.enqueueWriteBuffer(share_input_buffers[i], false, 0, in_size, buffer);
+    }
+    for (ov::InferRequest& ireq : inf_req_context) {
+        ireq.start_async();
+    }
+    for (ov::InferRequest& ireq : inf_req_context) {
+        ireq.wait();
+    }
+    // read the output into output buffers for result comparing
+    for (int i = 0; i < num_request; i++) {
+        ocl_instances[i]->_queue.enqueueReadBuffer(share_output_buffers[i], false, 0, out_size, out_tensors[i].data(), nullptr, nullptr);
+        // Wait for infer request and post-processing completion
+        ocl_instances[i]->_queue.finish();
+    }
+
+    // compare results
+    for (int i = 0; i < num_request; i++) {
+        {
+            ASSERT_EQ(output->get_element_type(), ov::element::f32);
+            ASSERT_EQ(output_tensor_regular.get_size(), out_tensors[i].get_size());
+            auto thr = FuncTestUtils::GetComparisonThreshold(InferenceEngine::Precision::FP32);
+            FuncTestUtils::compare_tensor(output_tensor_regular, out_tensors[i], thr);
+        }
     }
 }
