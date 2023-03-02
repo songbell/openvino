@@ -54,10 +54,11 @@ Pipeline MultiSchedule::GetPipeline(const IInferPtr& syncInferRequest, WorkerInf
             }
         });
     } else {
+        MultiImmediateExecutor::Ptr _FirstExecutor = std::make_shared<MultiImmediateExecutor>();
         pipeline = {
             // if the request is coming with device-specific remote blobs make sure it is scheduled to the specific device only:
             Stage {
-                /*TaskExecutor*/ std::make_shared<IE::ImmediateExecutor>(), /*task*/ [this, &syncInferRequest]() {
+                /*TaskExecutor*/ _FirstExecutor, /*task*/ [this, &syncInferRequest]() {
                     // by default, no preferred device:
                     _thisPreferredDeviceName = "";
                     auto execNetwork = _multiSContext->_executableNetwork.lock();
@@ -100,7 +101,8 @@ Pipeline MultiSchedule::GetPipeline(const IInferPtr& syncInferRequest, WorkerInf
                 }},
             // final task in the pipeline:
             Stage {
-                /*TaskExecutor*/std::make_shared<ThisRequestExecutor>(workerInferRequest), /*task*/ [this, &syncInferRequest, workerInferRequest]() {
+                /*TaskExecutor*/std::make_shared<ThisRequestExecutor>(workerInferRequest, _FirstExecutor), /*task*/
+                [this, &syncInferRequest, workerInferRequest]() {
                     if (nullptr != (*workerInferRequest)->_exceptionPtr) {
                         std::rethrow_exception((*workerInferRequest)->_exceptionPtr);
                     }
@@ -153,8 +155,16 @@ void MultiSchedule::GenerateWorkers(const std::string& device,
             [workerRequestPtr, this, device, idleWorkerRequestsPtr](std::exception_ptr exceptionPtr) mutable {
                 IdleGuard<NotBusyWorkerRequests> idleGuard{workerRequestPtr, *idleWorkerRequestsPtr};
                 workerRequestPtr->_exceptionPtr = exceptionPtr;
-                {
+                if (workerRequestPtr->_testExec->count == 1) {
+                    std::cout << "task executor " << workerRequestPtr->_testExec.get()
+                        << " continued on" << workerRequestPtr->_inferRequest._ptr.get() << std::endl;
                     auto capturedTask = std::move(workerRequestPtr->_task);
+                    capturedTask();
+                } else {
+                    auto capturedTask = std::move(workerRequestPtr->_testExec->_task);
+                    std::cout << "task re-initiated, task executor" << workerRequestPtr->_testExec.get()
+                                << " failed on" << workerRequestPtr->_inferRequest._ptr.get() << std::endl;
+                    workerRequestPtr->_testExec->count++;
                     capturedTask();
                 }
                 // try to return the request to the idle list (fails if the overall object destruction has began)

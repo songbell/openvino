@@ -16,12 +16,14 @@
 
 namespace MultiDevicePlugin {
 struct ThisRequestExecutor : public IE::ITaskExecutor {
-    explicit ThisRequestExecutor(WorkerInferRequest** ptr): _workptrptr{ptr} {}
+    explicit ThisRequestExecutor(WorkerInferRequest** ptr, MultiImmediateExecutor::Ptr test = nullptr): _workptrptr{ptr}, _testexecutor(test) {}
     void run(IE::Task task) override {
         (*_workptrptr)->_task = std::move(task);
+        (*_workptrptr)->_testExec = _testexecutor;;
         (*_workptrptr)->_inferRequest->StartAsync();
     };
     WorkerInferRequest** _workptrptr = nullptr;
+    MultiImmediateExecutor::Ptr _testexecutor;
 };
 
 class MultiSchedule : public Schedule, public IE::ITaskExecutor {
