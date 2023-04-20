@@ -14,16 +14,6 @@
 #define MOCKTESTMACRO
 #endif
 namespace MultiDevicePlugin {
-struct ThisRequestExecutor : public IE::ITaskExecutor {
-    explicit ThisRequestExecutor(WorkerInferRequest** ptr, MultiImmediateExecutor::Ptr executor = nullptr): _workptrptr{ptr}, _fallbackExec(executor) {}
-    void run(IE::Task task) override {
-        (*_workptrptr)->_task = std::move(task);
-        (*_workptrptr)->_fallbackExec = _fallbackExec;
-        (*_workptrptr)->_inferRequest->StartAsync();
-    };
-    WorkerInferRequest** _workptrptr = nullptr;
-    MultiImmediateExecutor::Ptr _fallbackExec;
-};
 struct AutoLoadContext {
     std::atomic<bool> isEnabled = {false};
     std::atomic<bool> isAlready = {false};
@@ -51,6 +41,7 @@ enum AutoLoadContextIndex {
     CONTEXTNUM = 3
 };
 class AutoSchedule : public Schedule, public IE::ITaskExecutor {
+friend class ThisRequestExecutor;
 public:
     using Ptr = std::shared_ptr<AutoSchedule>;
     void init(const ScheduleContext::Ptr& sContext) override;
@@ -69,6 +60,9 @@ public:
     // the bug is e.g. manifesting on the old CentOS (and it's 4.8.x gcc) used in our testing
     // https://gcc.gnu.org/bugzilla/show_bug.cgi?id=81880
     static thread_local const char* _thisPreferredDeviceName;
+    static thread_local const char* _currentDeviceName;
+    static thread_local bool _abortFlag;
+    static thread_local MultiImmediateExecutor::Ptr  _stateRestoreExecutor;
     AutoLoadContext                           _loadContext[CONTEXTNUM];
     std::unique_ptr<AutoLoadContext[]>        _pCTPUTLoadContext = nullptr;
     size_t                                    _nCTputDeviceNums = 0;
@@ -77,7 +71,7 @@ protected:
     void GenerateWorkers(const std::string& device, const SoExecNetwork& executableNetwork);
     bool ScheduleToWorkerInferRequest(IE::Task, DeviceName preferred_device = "");
     static bool RunPipelineTask(IE::Task& inferPipelineTask, NotBusyPriorityWorkerRequests& idleWorkerRequests,
-                                const DeviceName& preferred_device);
+                                const DeviceName& preferred_device, const DeviceName& current_device);
     std::string GetLogTag() const noexcept;
     DeviceMap<NotBusyPriorityWorkerRequests>                _idleWorkerRequests;
     AutoScheduleContext::Ptr                                _autoSContext;
@@ -111,4 +105,18 @@ private:
     bool                                                      _exitFlag = {false};
 };
 
+struct ThisRequestExecutor : public IE::ITaskExecutor {
+    explicit ThisRequestExecutor(WorkerInferRequest** ptr, MultiImmediateExecutor::Ptr executor = nullptr):
+        _workptrptr{ptr},
+        _fallbackExec(executor) {}
+    void run(IE::Task task) override {
+        if (!AutoSchedule::_abortFlag) {
+            (*_workptrptr)->_task = std::move(task);
+            (*_workptrptr)->_fallbackExec = _fallbackExec;
+            (*_workptrptr)->_inferRequest->StartAsync();
+        }
+    };
+    WorkerInferRequest** _workptrptr = nullptr;
+    MultiImmediateExecutor::Ptr _fallbackExec;
+};
 }  // namespace MultiDevicePlugin

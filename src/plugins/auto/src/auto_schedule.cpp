@@ -40,6 +40,9 @@ std::string GetNetworkPrecision(const IE::CNNNetwork& network) {
 thread_local WorkerInferRequest* AutoSchedule::_thisWorkerInferRequest = nullptr;
 // TODO: revert to the plain variable (see header file), when we moved to the next CentOS 8.x in our support matrix
 thread_local const char* AutoSchedule::_thisPreferredDeviceName = "";
+thread_local const char* AutoSchedule::_currentDeviceName = "";
+thread_local bool AutoSchedule::_abortFlag = false;
+thread_local MultiImmediateExecutor::Ptr AutoSchedule::_stateRestoreExecutor = nullptr;
 
 Pipeline AutoSchedule::GetPipeline(const IInferPtr& syncInferRequest, WorkerInferRequest** workerInferRequest) {
     Pipeline pipeline;
@@ -72,7 +75,7 @@ Pipeline AutoSchedule::GetPipeline(const IInferPtr& syncInferRequest, WorkerInfe
         pipeline = {
             // if the request is coming with device-specific remote blobs make sure it is scheduled to the specific device only:
             Stage {
-                /*TaskExecutor*/ _firstExecutor, /*task*/ [this, &syncInferRequest]() {
+                /*TaskExecutor*/ _firstExecutor, /*task*/ [this, &syncInferRequest, _firstExecutor]() {
                     // by default, no preferred device:
                     _thisPreferredDeviceName = "";
                     auto execNetwork = _autoSContext->_executableNetwork.lock();
@@ -101,17 +104,42 @@ Pipeline AutoSchedule::GetPipeline(const IInferPtr& syncInferRequest, WorkerInfe
                             }
                         }
                     }
+                    _abortFlag = false;
+                    _stateRestoreExecutor = _firstExecutor;
                 }},
             // as the scheduling algo may select any device, this stage accepts the scheduling decision (actual workerRequest)
             // then sets the device-agnostic blobs to the actual (device-specific) request
             Stage {
-                /*TaskExecutor*/std::dynamic_pointer_cast<IE::ITaskExecutor>(shared_from_this()), /*task*/ [&syncInferRequest, workerInferRequest]() {
+                /*TaskExecutor*/std::dynamic_pointer_cast<IE::ITaskExecutor>(shared_from_this()), /*task*/ [this, &syncInferRequest, workerInferRequest]() {
                     *workerInferRequest = _thisWorkerInferRequest;
                     auto multiSyncInferRequest = std::dynamic_pointer_cast<MultiDeviceInferRequest>(syncInferRequest);
-                    multiSyncInferRequest->SetBlobsToAnotherRequest(_thisWorkerInferRequest->_inferRequest);
-                    INFO_RUN([workerInferRequest]() {
-                        (*workerInferRequest)->_startTimes.push_back(std::chrono::steady_clock::now());
+                    try {
+                        multiSyncInferRequest->SetBlobsToAnotherRequest(_thisWorkerInferRequest->_inferRequest);
+                        INFO_RUN([workerInferRequest]() {
+                            (*workerInferRequest)->_startTimes.push_back(std::chrono::steady_clock::now());
                         });
+                    } catch (InferenceEngine::Exception) {
+                        if (_autoSContext->_runtimeFallback) {
+                            bool selectOtherDeviceFlag = false;
+                            // select other device
+                            try {
+                                selectOtherDeviceFlag = selectOtherDevice(_currentDeviceName);
+                                LOG_DEBUG_TAG("set blobs exception, trying runtime fallback");
+                            } catch (const IE::Exception& iie) {
+                                selectOtherDeviceFlag = false;
+                            }
+                            if (selectOtherDeviceFlag) {
+                                _stateRestoreExecutor->_task();
+                                _abortFlag = true;
+                            } else {
+                                std::rethrow_exception(std::current_exception());
+                            }
+                        } else {
+                            std::rethrow_exception(std::current_exception());
+                        }
+                    }
+                    // safe to clear state restore
+                    _stateRestoreExecutor = nullptr;
                 }},
             // final task in the pipeline:
             Stage {
@@ -802,7 +830,7 @@ bool AutoSchedule::ScheduleToWorkerInferRequest(IE::Task inferPipelineTask, Devi
         if (!preferred_device.empty() && (device.deviceName != preferred_device)) {
             continue;
         }
-        if (RunPipelineTask(inferPipelineTask, _idleWorkerRequests[device.deviceName], preferred_device)) {
+        if (RunPipelineTask(inferPipelineTask, _idleWorkerRequests[device.deviceName], preferred_device, device.deviceName)) {
             return true;
         }
     }
@@ -817,7 +845,8 @@ bool AutoSchedule::ScheduleToWorkerInferRequest(IE::Task inferPipelineTask, Devi
 
 bool AutoSchedule::RunPipelineTask(IE::Task& inferPipelineTask,
     NotBusyPriorityWorkerRequests& idleWorkerRequests,
-    const DeviceName& preferred_device) {
+    const DeviceName& preferred_device,
+    const DeviceName& current_device) {
     WorkerInferRequest* workerRequestPtr = nullptr;
     std::pair<int, WorkerInferRequest*> worker;
     if (idleWorkerRequests.try_pop(worker)) {
@@ -826,6 +855,7 @@ bool AutoSchedule::RunPipelineTask(IE::Task& inferPipelineTask,
         _thisWorkerInferRequest = workerRequestPtr;
         {
             auto capturedTask = std::move(inferPipelineTask);
+            _currentDeviceName = current_device.c_str();
             capturedTask();
         }
         idleGuard.Release();

@@ -453,3 +453,101 @@ INSTANTIATE_TEST_SUITE_P(smoke_AutoCTPUTRuntimeFallback,
                          AutoCTPUTRuntimeFallback,
                          ::testing::ValuesIn(testCtputConfigs),
                          AutoCTPUTRuntimeFallback::getTestCaseName);
+
+using AutoCTPUTSetBlobErrorRuntimeFallback = AutoRuntimeFallback;
+TEST_P(AutoCTPUTSetBlobErrorRuntimeFallback, ctputDeviceInferFailTest) {
+    std::string targetDev;
+    std::vector<std::tuple<std::string, bool>> targetDevices; //std::tuple<deviceName, will infer throw exception>
+    int loadNetworkNum;
+    bool enableRumtimeFallback;
+    bool expectThrow;
+    bool loadNetworkFail;
+    bool generateWorkersFail;
+    std::tie(targetDevices, loadNetworkNum, enableRumtimeFallback, expectThrow, loadNetworkFail, generateWorkersFail) = this->GetParam();
+    if (loadNetworkFail) {
+        ON_CALL(*core, LoadNetwork(::testing::Matcher<const InferenceEngine::CNNNetwork&>(_),
+            ::testing::Matcher<const std::string&>(StrEq("GPU.1")),
+            ::testing::Matcher<const Config&>(_))).WillByDefault(Throw(InferenceEngine::GeneralError{""}));
+    }
+    std::vector<AsyncInferRequestThreadSafeDefault::Ptr> asyncRequests;
+    for (auto& deviceInfo : targetDevices) {
+        std::string deviceName;
+        bool ifThrow;
+        std::tie(deviceName, ifThrow) = deviceInfo;
+        targetDev += deviceName;
+        targetDev += ((deviceInfo == targetDevices.back()) ? "" : ",");
+        ITaskExecutor::Ptr exec = std::make_shared<ImmediateExecutor>();
+        std::shared_ptr<AsyncInferRequestThreadSafeDefault> mockAsyncInferrequest;
+        std::shared_ptr<AsyncInferRequestThreadSafeDefault> mockAsyncInferrequestGPU_0;
+        std::shared_ptr<AsyncInferRequestThreadSafeDefault> mockAsyncInferrequestGPU_1;
+        if (deviceName == "CPU") {
+            auto inferReq = std::make_shared<NiceMock<MockIInferRequestInternal>>();
+            mockAsyncInferrequest = std::make_shared<AsyncInferRequestThreadSafeDefault>(inferReq, exec, exec);
+            if (ifThrow)
+                ON_CALL(*inferReq, SetBlob(_, _)).WillByDefault(Throw(InferenceEngine::GeneralError{"set blob error"}));
+            ON_CALL(*mockIExeNet.get(), CreateInferRequest()).WillByDefault(Return(mockAsyncInferrequest));
+        } else if (deviceName == "GPU.0") {
+            auto inferReq = std::make_shared<NiceMock<MockIInferRequestInternal>>();
+            mockAsyncInferrequestGPU_0 = std::make_shared<AsyncInferRequestThreadSafeDefault>(inferReq, exec, exec);
+            if (ifThrow)
+                ON_CALL(*inferReq, SetBlob(_, _)).WillByDefault(Throw(InferenceEngine::GeneralError{"set blob error"}));
+            ON_CALL(*mockIExeNetGPU_0.get(), CreateInferRequest()).WillByDefault(Return(mockAsyncInferrequestGPU_0));
+        } else if (deviceName == "GPU.1") {
+            auto inferReq = std::make_shared<NiceMock<MockIInferRequestInternal>>();
+            mockAsyncInferrequestGPU_1 = std::make_shared<AsyncInferRequestThreadSafeDefault>(inferReq, exec, exec);
+            if (ifThrow)
+                ON_CALL(*inferReq, SetBlob(_, _)).WillByDefault(Throw(InferenceEngine::GeneralError{"set blob error"}));
+            ON_CALL(*mockIExeNetGPU_1.get(), CreateInferRequest()).WillByDefault(Return(mockAsyncInferrequestGPU_1));
+        } else {
+            return;
+        }
+    }
+    plugin->SetName("AUTO");
+    config.insert({InferenceEngine::MultiDeviceConfigParams::KEY_MULTI_DEVICE_PRIORITIES, targetDev});
+    config.insert({InferenceEngine::PluginConfigParams::KEY_PERFORMANCE_HINT,
+                   InferenceEngine::PluginConfigParams::CUMULATIVE_THROUGHPUT});
+    if (!enableRumtimeFallback) {
+        config.insert({{"ENABLE_RUNTIME_FALLBACK", "NO"}});
+    }
+
+    EXPECT_CALL(*core,
+                LoadNetwork(::testing::Matcher<const InferenceEngine::CNNNetwork&>(_),
+                            ::testing::Matcher<const std::string&>(_),
+                            ::testing::Matcher<const std::map<std::string, std::string>&>(_)))
+        .Times(loadNetworkNum);
+
+    std::shared_ptr<InferenceEngine::IExecutableNetworkInternal> exeNetwork;
+    std::shared_ptr<IInferRequestInternal> infer_request;
+
+    ASSERT_NO_THROW(exeNetwork = plugin->LoadExeNetworkImpl(cnnNet, config));
+    std::map<std::string, InputsDataMap> m_inputs_map;
+    std::map<std::string, OutputsDataMap> m_outputs_map;
+    std::string name = cnnNet.getFunction()->get_friendly_name();
+    m_inputs_map[name] = cnnNet.getInputsInfo();
+    m_outputs_map[name] = cnnNet.getOutputsInfo();
+    exeNetwork->setNetworkInputs(m_inputs_map[name]);
+    exeNetwork->setNetworkOutputs(m_outputs_map[name]);
+    ASSERT_NO_THROW(infer_request = exeNetwork->CreateInferRequest());
+    if (expectThrow) {
+        EXPECT_THROW(infer_request->Infer(), IE::Exception);
+    } else {
+        infer_request->Infer();
+    }
+}
+
+// ConfigParams: targetDevices(deviceName, will set blob throw exception), loadNetworkNum, enableRumtimeFallback,
+// expectThrow, loadNetworkFail, generateWorkersFail
+const std::vector<ConfigParams> testCtputSetBlobConfigs = {
+    ConfigParams{{{"CPU", false}, {"GPU.0", true}, {"GPU.1", true}}, 3, true, false, false, false},
+    ConfigParams{{{"CPU", true}, {"GPU.0", false}, {"GPU.1", true}}, 3, true, false, false, false},
+    ConfigParams{{{"CPU", true}, {"GPU.0", true}, {"GPU.1", false}}, 3, true, false, false, false},
+    ConfigParams{{{"CPU", true}, {"GPU.0", true}, {"GPU.1", true}}, 3, true, true, false, false},
+    // disable RumtimeFallback
+    ConfigParams{{{"CPU", false}, {"GPU.0", false}, {"GPU.1", false}}, 3, false, false, false, false},
+    ConfigParams{{{"CPU", true}, {"GPU.0", false}, {"GPU.1", false}}, 3, false, true, false, false},
+};
+
+INSTANTIATE_TEST_SUITE_P(smoke_AutoCTPUTRuntimeFallback,
+                         AutoCTPUTSetBlobErrorRuntimeFallback,
+                         ::testing::ValuesIn(testCtputSetBlobConfigs),
+                         AutoCTPUTSetBlobErrorRuntimeFallback::getTestCaseName);
