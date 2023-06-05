@@ -12,9 +12,6 @@
 #include "openvino/runtime/exec_model_info.hpp"
 #include "openvino/runtime/properties.hpp"
 #include "plugin.hpp"
-//#include "check_network_batchable.hpp"
-#include "ie_plugin_config.hpp"
-
 #include <ie_performance_hints.hpp>
 
 namespace ov {

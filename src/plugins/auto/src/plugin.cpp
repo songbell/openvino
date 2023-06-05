@@ -170,10 +170,6 @@ std::vector<DeviceInformation> Plugin::parse_meta_devices(const std::string& pri
         } catch (ov::Exception& err) {
             LOG_DEBUG_TAG("get default device id failed for ", device_name.c_str());
             return "";
-        } catch (InferenceEngine::Exception& err) {
-            // some remain with IE exceptions
-            LOG_DEBUG_TAG("get default device id failed for ", device_name.c_str());
-            return "";
         }
     };
     auto check_priority_config = [&] (const std::string& pri_string) {
