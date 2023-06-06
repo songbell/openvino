@@ -455,10 +455,40 @@ std::shared_ptr<ov::ICompiledModel> Plugin::compile_model_impl(const std::string
     auto_s_context->m_runtime_fallback = load_config.get_property(ov::intel_auto::enable_runtime_fallback);
     auto_s_context->m_bind_buffer = load_config.get_property(ov::intel_auto::device_bind_buffer);
     std::shared_ptr<ov::ICompiledModel> impl;
+    std::shared_ptr<Schedule> scheduler;
+    if (is_cumulative)
+        scheduler = std::make_shared<CumuSchedule>();
+    else
+        scheduler = std::make_shared<AutoSchedule>();
+    // scheduler start to compile
+    scheduler->launch(auto_s_context);
+    if (!cloned_model) {
+        // fake a model for compile model inputs/outputs in caching case
+        OPENVINO_ASSERT(auto_s_context->m_hw_compiled_model);
+        auto inputs = auto_s_context->m_hw_compiled_model->inputs();
+        auto outputs = auto_s_context->m_hw_compiled_model->outputs();
+        ov::ParameterVector params;
+        ov::ResultVector results;
+        for (const auto& port : inputs) {
+            auto param = std::make_shared<op::v0::Parameter>(port.get_element_type(), port.get_shape());
+            params.emplace_back(param);
+        }
+        for (const auto& port : outputs) {
+            auto node = std::const_pointer_cast<ov::Node>(port.get_node_shared_ptr());
+            auto fake_port = ov::Output<ov::Node>(node, port.get_index());
+            auto result = std::make_shared<ov::op::v0::Result>(fake_port);
+            results.emplace_back(result);
+        }
+        try {
+            cloned_model = std::make_shared<ov::Model>(results, params);
+        } catch (...) {
+            LOG_INFO_TAG("failed in faking model");
+        }
+    }
     if (is_cumulative) {
-        impl = std::make_shared<AutoCumuCompiledModel>(cloned_model, shared_from_this(), auto_s_context, std::make_shared<CumuSchedule>());
+        impl = std::make_shared<AutoCumuCompiledModel>(cloned_model, shared_from_this(), auto_s_context, scheduler);
     } else {
-        impl = std::make_shared<AutoCompiledModel>(cloned_model, shared_from_this(), auto_s_context, std::make_shared<AutoSchedule>());
+        impl = std::make_shared<AutoCompiledModel>(cloned_model, shared_from_this(), auto_s_context, scheduler);
     }
     return impl;
 }
