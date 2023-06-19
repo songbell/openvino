@@ -68,6 +68,7 @@ ov::AnyMap ov::auto_plugin::CompiledModel::get_device_supported_properties(AutoC
     auto device_supported_configs = context.m_compiled_model->get_property(METRIC_KEY(SUPPORTED_CONFIG_KEYS));
     for (auto&& property_name : device_supported_configs.as<std::vector<std::string>>()) {
         device_properties[property_name] = context.m_compiled_model->get_property(property_name);
+    }
     all_devices[context.m_device_info.device_name] = device_properties;
     return all_devices;
 }
