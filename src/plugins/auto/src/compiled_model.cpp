@@ -60,14 +60,14 @@ std::string ov::auto_plugin::CompiledModel::get_log_tag() const noexcept {
 ov::AnyMap ov::auto_plugin::CompiledModel::get_device_supported_properties(AutoCompileContext& context) {
      ov::AnyMap all_devices;
     ov::AnyMap device_properties = {};
-    OPENVINO_ASSERT(context.m_exe_network);
-    auto device_supported_metrics = context.m_exe_network->get_property(METRIC_KEY(SUPPORTED_METRICS));
+    OPENVINO_ASSERT(context.m_compiled_model);
+    auto device_supported_metrics = context.m_compiled_model->get_property(METRIC_KEY(SUPPORTED_METRICS));
     for (auto&& property_name : device_supported_metrics.as<std::vector<std::string>>()) {
-        device_properties[property_name] = context.m_exe_network->get_property(property_name);
+        device_properties[property_name] = context.m_compiled_model->get_property(property_name);
     }
-    auto device_supported_configs = context.m_exe_network->get_property(METRIC_KEY(SUPPORTED_CONFIG_KEYS));
+    auto device_supported_configs = context.m_compiled_model->get_property(METRIC_KEY(SUPPORTED_CONFIG_KEYS));
     for (auto&& property_name : device_supported_configs.as<std::vector<std::string>>()) {
-        device_properties[property_name] = context.m_exe_network->get_property(property_name);
+        device_properties[property_name] = context.m_compiled_model->get_property(property_name);
     all_devices[context.m_device_info.device_name] = device_properties;
     return all_devices;
 }
