@@ -62,6 +62,9 @@ ov::AnyMap ov::auto_plugin::CompiledModel::get_device_supported_properties(AutoC
     ov::AnyMap device_properties = {};
     OPENVINO_ASSERT(context.m_compiled_model);
     auto device_supported_properties = context.m_compiled_model->get_property(ov::supported_properties.name());
+    for (auto& property_name : device_supported_properties.as<std::vector<ov::PropertyName>>()) {
+        device_properties[property_name] = context.m_compiled_model->get_property(property_name);
+    }
     all_devices[context.m_device_info.device_name] = device_properties;
     return all_devices;
 }
