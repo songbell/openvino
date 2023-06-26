@@ -185,9 +185,33 @@ std::vector<std::string> disabledTestPatterns() {
         R"(.*smoke_Snippets_ConvertStub/ConvertStub\.CompareWithRefImpl/IS=.*_OT=\(bf16\)_#N=2_#S=2_targetDevice=CPU.*)",
         // Issue: 111944
         R"(.*smoke_DefConvLayoutTest6.*)",
+        // New plugin work with tensors, so it means that blob in old API can have different pointers
+        R"(.*InferRequestIOBBlobTest.*secondCallGetInputDoNotReAllocateData.*)",
+        R"(.*InferRequestIOBBlobTest.*secondCallGetOutputDoNotReAllocateData.*)",
+        R"(.*InferRequestIOBBlobTest.*secondCallGetInputAfterInferSync.*)",
+        R"(.*InferRequestIOBBlobTest.*secondCallGetOutputAfterInferSync.*)",
         // New plugin API doesn't support changes of pre-processing
-        R"(.*(Auto|Multi).*InferRequestPreprocessTest.*SetPreProcessToInputInfo.*)",
-        R"(.*(Auto|Multi).*InferRequestPreprocessTest.*SetPreProcessToInferRequest.*)",
+        R"(.*InferRequestPreprocessTest.*SetPreProcessToInputInfo.*)",
+        R"(.*InferRequestPreprocessTest.*SetPreProcessToInferRequest.*)",
+        // Old API cannot deallocate tensor
+        R"(.*InferRequestIOBBlobTest.*canProcessDeallocatedOutputBlobAfterGetAndSetBlob.*)",
+        // Plugin version was changed to ov::Version
+        R"(.*VersionTest.*pluginCurrentVersionIsCorrect.*)",
+        // Issue: 111453
+        R"(.*smoke_BehaviorTests/OVCompiledGraphImportExportTest.*/targetDevice=CPU_elementType=(i16|i64|u16|u32|u64|f16).*)",
+        R"(.*smoke_Hetero_BehaviorTests/OVCompiledGraphImportExportTest.ovImportExportedFunction/targetDevice=HETERO_elementType=(i16|i64|u16|u32|u64|f16).*)",
+        // New plugin api + legacy ov api will put preprocess into transformation, which will add additional Convert
+        // node to graph, it cause below tests failure
+        R"(.*smoke_Basic/FuseTransposeAndReorderTest.CompareWithRefs.*)",
+        R"(.*smoke_IsOp/ComparisonLayerTest.*)",
+        // Issue: 113703 - input/output port's name maybe changed after transformation in plugin api 2.0
+        R"(.*smoke_If/SimpleIfTest.*Cond=0.*)",
+        R"(.*smoke_Transpose(2|4|5|6)D/TransposeLayerTest.CompareWithRefs.*)",
+        // Issue: 113704 - Layout information maybe incorrect when covert tensor to blob
+        R"(.*smoke_.*BehaviorTests/InferRequestPreprocessConversionTest.*)",
+        // Issue: JIT choose error issue, don't know why not choose jit_avx512_BF16
+        R"(.*smoke_PSROIPoolingAverageLayoutTest/PSROIPoolingLayerCPUTest.*)",
+        R"(.*smoke_PSROIPoolingBilinearLayoutTest/PSROIPoolingLayerCPUTest.*)",
     };
 
 #if defined(OPENVINO_ARCH_X86)

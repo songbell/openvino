@@ -4,26 +4,26 @@
 
 #pragma once
 
-#include "cpp/ie_cnn_network.h"
-#include "config.h"
-#include "cpu_memory.h"
-#include "normalize_preprocess.h"
-#include "node.h"
-#include "edge.h"
-#include "cache/multi_cache.h"
-#include "dnnl_scratch_pad.h"
-#include "graph_context.h"
+#include <atomic>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
-#include <memory>
-#include <atomic>
+
+#include "cache/multi_cache.h"
+#include "config.h"
+#include "cpu_memory.h"
+#include "dnnl_scratch_pad.h"
+#include "edge.h"
+#include "graph_context.h"
+#include "node.h"
+#include "normalize_preprocess.h"
+#include "openvino/runtime/profiling_info.hpp"
 
 namespace ov {
 namespace intel_cpu {
 
-class InferRequestBase;
-class InferRequest;
+class SyncInferRequest;
 
 class Graph {
 public:
@@ -58,10 +58,12 @@ public:
         return _normalizePreprocMap.find(name) != _normalizePreprocMap.end();
     }
 
-    void PushInputData(const std::string& name, const InferenceEngine::Blob::Ptr &in);
-    void PullOutputData(InferenceEngine::BlobMap &out);
+    void PushInputData(const std::string& name, const ov::Tensor& in);
+    void PullOutputData(std::unordered_map<std::string, ov::Tensor>& out,
+                        std::unordered_map<std::string, bool>& out_precision_changed,
+                        std::unordered_map<std::string, ov::Tensor>& aux_tensors);
 
-    void Infer(InferRequestBase* request = nullptr);
+    void Infer(SyncInferRequest* request = nullptr);
 
     const std::vector<NodePtr>& GetNodes() const {
         return graphNodes;
@@ -113,7 +115,7 @@ public:
         return context;
     }
 
-    void GetPerfData(std::map<std::string, InferenceEngine::InferenceEngineProfileInfo> &perfMap) const;
+    void GetPerfData(std::vector<ov::ProfilingInfo> &perfMap) const;
 
     void RemoveDroppedNodes();
     void RemoveDroppedEdges();
@@ -233,12 +235,10 @@ protected:
     void ExtractExecutableNodes();
     void ExecuteNode(const NodePtr& node, const dnnl::stream& stream) const;
     void CreatePrimitivesAndExecConstants() const;
-    void InferStatic(InferRequestBase* request);
-    void InferDynamic(InferRequestBase* request);
+    void InferStatic(SyncInferRequest* request);
+    void InferDynamic(SyncInferRequest* request);
 
-    friend class LegacyInferRequest;
-    friend class intel_cpu::InferRequest;
-    friend class intel_cpu::InferRequestBase;
+    friend class intel_cpu::SyncInferRequest;
     friend std::shared_ptr<ngraph::Function> dump_graph_as_ie_ngraph_net(const Graph &graph);
 
 private:
@@ -258,5 +258,5 @@ private:
     void EnforceInferencePrecision();
 };
 
-}   // namespace intel_cpu
-}   // namespace ov
+}  // namespace intel_cpu
+}  // namespace ov

@@ -2,58 +2,55 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-#include <algorithm>
-#include <string>
-#include <map>
-#include <vector>
-#include <tuple>
-#include <unordered_set>
-#include <limits>
-#include <fstream>
-#include <unordered_map>
-#include <memory>
-#include <utility>
-
 #include "graph.h"
-#include "graph_dumper.h"
-#include "graph_optimizer.h"
+
+#include <algorithm>
+#include <fstream>
+#include <limits>
+#include <map>
+#include <memory>
+#include <string>
+#include <tuple>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+#include "blob_factory.hpp"
+#include "common/primitive_desc.hpp"
+#include "common/primitive_desc_iface.hpp"
 #include "dnnl_extension_utils.h"
 #include "extension_mngr.h"
-#include "memory_solver.hpp"
-#include "itt.h"
+#include "graph_dumper.h"
+#include "graph_optimizer.h"
+#include "ie_algorithm.hpp"
+#include "ie_plugin_config.hpp"
 #include "infer_request.h"
-#include "nodes/input.h"
-#include <nodes/reorder.h>
-#include "nodes/convert.h"
-#include "nodes/subgraph.h"
-#include "nodes/fullyconnected.h"
-
-#include <ie_algorithm.hpp>
-#include <blob_factory.hpp>
-#include "nodes/common/cpu_memcpy.h"
-#include "nodes/common/cpu_convert.h"
-
-#include "precision_utils.h"
-#include <ie_plugin_config.hpp>
-
-#include "utils/general_utils.h"
-#include "utils/debug_capabilities.h"
-#include "utils/node_dumper.h"
-#include "utils/ngraph_utils.hpp"
-#include "utils/cpu_utils.hpp"
-#include "utils/verbose.h"
+#include "itt.h"
+#include "low_precision/low_precision.hpp"
 #include "memory_desc/cpu_memory_desc_utils.h"
-
-#include <ngraph/node.hpp>
-#include <ngraph/function.hpp>
-#include <ngraph/ops.hpp>
-#include <transformations/utils/utils.hpp>
-#include <low_precision/low_precision.hpp>
 #include "memory_desc/dnnl_blocked_memory_desc.h"
-#include <common/primitive_desc.hpp>
-#include <common/primitive_desc_iface.hpp>
+#include "memory_solver.hpp"
+#include "ngraph/function.hpp"
+#include "ngraph/node.hpp"
+#include "ngraph/ops.hpp"
+#include "nodes/common/cpu_convert.h"
+#include "nodes/common/cpu_memcpy.h"
+#include "nodes/convert.h"
+#include "nodes/fullyconnected.h"
+#include "nodes/input.h"
+#include "nodes/reorder.h"
+#include "nodes/subgraph.h"
+#include "precision_utils.h"
+#include "transformations/utils/utils.hpp"
+#include "utils/cpu_utils.hpp"
+#include "utils/debug_capabilities.h"
+#include "utils/general_utils.h"
+#include "utils/ngraph_utils.hpp"
+#include "utils/node_dumper.h"
+#include "utils/verbose.h"
 #if (OV_THREAD == OV_THREAD_TBB || OV_THREAD == OV_THREAD_TBB_AUTO)
-#   include <tbb/task.h>
+#    include <tbb/task.h>
 #endif
 
 using namespace dnnl;
@@ -86,10 +83,10 @@ void Graph::CreateGraph(NET &net, const GraphContext::CPtr ctx) {
     CPU_DEBUG_CAP_ENABLE(serialize(*this));
 }
 
-void Graph::CreateGraph(const std::vector<NodePtr> &graphNodes,
-                              const std::vector<EdgePtr> &graphEdges,
-                              const GraphContext::CPtr ctx,
-                              std::string name) {
+void Graph::CreateGraph(const std::vector<NodePtr>& graphNodes,
+                        const std::vector<EdgePtr>& graphEdges,
+                        const GraphContext::CPtr ctx,
+                        std::string name) {
     if (IsReady())
         ForgetGraphData();
 
@@ -118,7 +115,7 @@ template void Graph::CreateGraph(const std::shared_ptr<const ngraph::Function>&,
 template void Graph::CreateGraph(const CNNNetwork&, const GraphContext::CPtr);
 
 void Graph::Replicate(const std::shared_ptr<const ov::Model> &subgraph) {
-    this->_name = "subgraph";
+    this->_name = subgraph->get_friendly_name();
     this->reuse_io_tensors = false;
 
     // Map data object onto producer node
@@ -139,6 +136,7 @@ void Graph::Replicate(const std::shared_ptr<const ov::Model> &subgraph) {
         return -1;
     };
 
+    const bool is_legacy_api = getConfig().isLegacyApi;
     for (const auto& op : subgraph->get_ordered_ops()) {
         const NodePtr node {Node::factory().create(op, context)};
 
@@ -146,11 +144,13 @@ void Graph::Replicate(const std::shared_ptr<const ov::Model> &subgraph) {
 
         if (op->get_type_info() == ngraph::op::v0::Parameter::get_type_info_static()) {
             inputNodesMap[node->getName()] = node;
+            if (node->isDynamicNode()) {
+                graphHasDynamicInput = true;
+            }
         }
 
         if (op->get_type_info() == ngraph::op::v0::Result::get_type_info_static()) {
-            const auto prev = op->input_value(0);
-            const std::string inputID = ov::op::util::get_ie_output_name(prev);
+            const std::string inputID = get_port_name(op->output(0), is_legacy_api);
 
             outputNodesMap[inputID] = node;
         }
@@ -193,6 +193,64 @@ void Graph::Replicate(const std::shared_ptr<const ov::Model> &subgraph) {
     }
 
     EnforceInferencePrecision();
+
+    auto hasSubgraphConsumers = [](const NodePtr& node) -> bool {
+        const auto& childEdges = node->getChildEdges();
+        return std::any_of(childEdges.begin(), childEdges.end(), [](const EdgeWeakPtr& edge) -> bool {
+            auto edgePtr = edge.lock();
+            if (!edgePtr)
+                return false;
+            return edgePtr->getChild()->getType() == Type::Subgraph;
+        });
+    };
+
+    auto input_ports = subgraph->inputs();
+    auto find_input_port_prec = [&input_ports, &is_legacy_api](const std::string& name) -> ov::element::Type_t {
+        for (auto& it : input_ports) {
+            auto port_name = get_port_name(it, is_legacy_api);
+            if (port_name == name)
+                return it.get_element_type();
+            port_name = it.get_node_shared_ptr()->get_friendly_name();
+            if (port_name == name)
+                return it.get_element_type();
+        }
+        OPENVINO_THROW("Cannot find input port with name: ", name);
+    };
+    // change precision for input/output nodes to avoid extra data conversion when set input/output blobs
+    // also we need to change input/output precisions for consumers/producers to avoid inserting reorder
+    for (auto& input : inputNodesMap) {
+        auto prec = InferenceEngine::details::convertPrecision(find_input_port_prec(input.first));
+        const auto precToSet = normalizeToSupportedPrecision(prec);
+        input.second->setOriginalOutputPrecisionAtPort(0, precToSet);
+        const auto childEdges = input.second->getChildEdgesAtPort(0);
+        for (size_t i = 0; i < childEdges.size(); i++) {
+            const auto child = childEdges[i]->getChild();
+            if (child->getOriginalInputPrecisionAtPort(childEdges[i]->getOutputNum()) != Precision::BF16 &&
+                // remove this WA when #78939 is resolved
+                !hasSubgraphConsumers(child))
+                child->setOriginalInputPrecisionAtPort(childEdges[i]->getOutputNum(), precToSet);
+        }
+    }
+
+    auto output_ports = subgraph->outputs();
+    auto find_output_port_prec = [&output_ports, &is_legacy_api](const std::string& name) -> ov::element::Type_t {
+        for (auto& it : output_ports) {
+            auto port_name = get_port_name(it, is_legacy_api);
+            if (port_name == name)
+                return it.get_element_type();
+        }
+        OPENVINO_THROW("Cannot find output port with name: ", name);
+    };
+    for (auto& output : outputNodesMap) {
+        auto prec = InferenceEngine::details::convertPrecision(find_output_port_prec(output.first));
+        const auto precToSet = normalizeToSupportedPrecision(prec);
+        output.second->setOriginalInputPrecisionAtPort(0, precToSet);
+        const auto parentEdges = output.second->getParentEdgesAtPort(0);
+        for (size_t i = 0; i < parentEdges.size(); i++) {
+            const auto parent = parentEdges[i]->getParent();
+            parent->setOriginalOutputPrecisionAtPort(parentEdges[i]->getInputNum(), precToSet);
+        }
+    }
 }
 
 void Graph::Replicate(const CNNNetwork &network) {
@@ -228,6 +286,7 @@ void Graph::Replicate(const CNNNetwork &network) {
 
     OV_ITT_SCOPE_NEXT(FIRST_INFERENCE, taskChain, "AllNodes");
 
+    const bool is_legacy_api = getConfig().isLegacyApi;
     // Replicate All Nodes in topological order
     for (const auto& op : orderedOps) {
         const NodePtr node(Node::factory().create(op, context));
@@ -245,8 +304,7 @@ void Graph::Replicate(const CNNNetwork &network) {
         }
 
         if (op->get_type_info() == ngraph::op::v0::Result::get_type_info_static()) {
-            const auto &input = op->input_value(0);
-            const auto name = ov::op::util::get_ie_output_name(input);
+            const auto name = get_port_name(op->output(0), is_legacy_api);
 
             if (outputsInfo.count(name) != 0) {
                 outputNodesMap[name] = node;
@@ -874,21 +932,49 @@ void Graph::Allocate() {
     for (auto& edge : graphEdges) edge->validate();
 }
 
-void Graph::PushInputData(const std::string& name, const InferenceEngine::Blob::Ptr &in) {
+void Graph::PushInputData(const std::string& name, const ov::Tensor &in) {
     if (!IsReady()) IE_THROW()<< "Wrong state. Topology not ready.";
 
     auto input = inputNodesMap.find(name);
     if (input != inputNodesMap.end()) {
-        auto& inTensorDesc = in->getTensorDesc();
+        auto create_tensor_desc = [&](const ov::Tensor& tensor) -> InferenceEngine::TensorDesc {
+            auto element_type = tensor.get_element_type();
+            auto shape = tensor.get_shape();
+            std::vector<size_t> blk_order(shape.size());
+            std::iota(blk_order.begin(), blk_order.end(), 0);
+            std::vector<size_t> dim_offset(shape.size(), 0);
+            std::vector<size_t> blk_strides;
+            auto byte_strides = element_type.bitwidth() >= 8 ? tensor.get_strides() : Strides{};
+            if (byte_strides.empty()) {
+                blk_strides = ov::row_major_strides(shape);
+            } else {
+                blk_strides.resize(byte_strides.size());
+                std::transform(byte_strides.begin(),
+                               byte_strides.end(),
+                               blk_strides.begin(),
+                               [&element_type](size_t byte_stride) {
+                                   OPENVINO_ASSERT(byte_stride % element_type.size() == 0,
+                                                   "Limitation: Stride in bytes ",
+                                                   byte_stride,
+                                                   " should be divisible by size of element ",
+                                                   element_type.size());
+                                   return byte_stride / element_type.size();
+                               });
+            }
+            return ie::TensorDesc{ie::details::convertPrecision(element_type),
+                                  shape,
+                                  ie::BlockingDesc{shape, blk_order, 0, dim_offset, blk_strides}};
+        };
+        auto inTensorDesc = create_tensor_desc(in);
         auto node = input->second;
         auto childEdge = node->getChildEdgeAt(0);
         const auto& outDims = node->getOutputShapeAtPort(0);
 
-        const void *ext_data_ptr = in->cbuffer();
+        const void *ext_data_ptr = in.data();
         void *inter_data_ptr = childEdge->getMemory().GetData();
 
         if (ext_data_ptr != inter_data_ptr) {
-            auto ext_tdesc = MemoryDescUtils::convertToDnnlBlockedMemoryDesc(in->getTensorDesc());
+            auto ext_tdesc = MemoryDescUtils::convertToDnnlBlockedMemoryDesc(inTensorDesc);
 
             Memory ext_mem(getEngine());
             ext_mem.Create(ext_tdesc, ext_data_ptr, false);
@@ -910,7 +996,9 @@ void Graph::PushInputData(const std::string& name, const InferenceEngine::Blob::
     }
 }
 
-void Graph::PullOutputData(BlobMap &out) {
+void Graph::PullOutputData(std::unordered_map<std::string, ov::Tensor>& out,
+                           std::unordered_map<std::string, bool>& out_precision_changed,
+                           std::unordered_map<std::string, ov::Tensor>& aux_tensors) {
     if (!IsReady())
         IE_THROW() << "Wrong state. Topology not ready.";
 
@@ -926,8 +1014,12 @@ void Graph::PullOutputData(BlobMap &out) {
             IE_THROW(Unexpected) << "The CPU plugin graph doesn't contain output node with name: \"" << name << "\"";
         }
 
+        InferenceEngine::TensorDesc expectedDesc(
+            InferenceEngine::details::convertPrecision(ext_blob.get_element_type()),
+            ext_blob.get_shape(),
+            InferenceEngine::TensorDesc::getLayoutByRank(ext_blob.get_shape().size()));
+
         const auto actualDesc = MemoryDescUtils::convertToTensorDesc(intr_blob.getDesc());
-        auto &expectedDesc = ext_blob->getTensorDesc();
 
         // TODO [NM]: need to create universal reorder which will be detect cases when we really need to use it
         // WA: for cases when output shape after transformation will be 1x1x1x1 but model output is scalar
@@ -943,13 +1035,17 @@ void Graph::PullOutputData(BlobMap &out) {
         }
 
         auto outDims = intr_blob.getStaticDims();
-        if (out[name]->getTensorDesc().getDims() != outDims && !isScalarOutput) {
+        if (out[name].get_shape() != outDims && !isScalarOutput) {
             // WA: because input/output info initially contains non empty dims, order etc.
             // and setDims (called inside setShape) can't correct modify blocked desc for desc with blocked layout
             if (expectedDesc.getLayout() == InferenceEngine::Layout::BLOCKED) {
                 expectedDesc = TensorDesc(expectedDesc.getPrecision(), expectedDesc.getLayout());
             }
-            out[name]->setShape(outDims);
+            out[name].set_shape(outDims);
+            expectedDesc =
+                InferenceEngine::TensorDesc(InferenceEngine::details::convertPrecision(out[name].get_element_type()),
+                                            out[name].get_shape(),
+                                            InferenceEngine::TensorDesc::getLayoutByRank(out[name].get_shape().size()));
         }
 
         // check for empty output blob
@@ -959,13 +1055,34 @@ void Graph::PullOutputData(BlobMap &out) {
 
         auto srcPrec = actualDesc.getPrecision();
         auto dstPrec = expectedDesc.getPrecision();
-
-        if (!getConfig().isLegacyApi && srcPrec == dstPrec && ext_blob->byteSize() != intr_blob.GetSize())
-            IE_THROW() << "Output blob byte size is not equal network output byte size (" << ext_blob->byteSize()
+        if (!getConfig().isLegacyApi && srcPrec == dstPrec && ext_blob.get_byte_size() != intr_blob.GetSize())
+            IE_THROW() << "Output blob byte size is not equal network output byte size (" << ext_blob.get_byte_size()
                        << "!=" << intr_blob.GetSize() << ").";
 
-        void *ext_blob_ptr = ext_blob->buffer();
+        void *ext_blob_ptr = ext_blob.data();
         void *intr_blob_ptr = intr_blob.GetData();
+
+        // If output precision has been changed comparing to original model's output, it must be copied to aux tensor
+        if (out_precision_changed[name]) {
+            auto it = aux_tensors.find(name);
+            if (it == aux_tensors.end()) {
+                OPENVINO_THROW("Output precision has been changed, but cannot find its aux tensor.");
+            }
+
+            auto& aux_tensor = it->second;
+            aux_tensor.set_shape(out[name].get_shape());
+            ext_blob_ptr = aux_tensor.data();
+            if ((intr_blob_ptr == nullptr) || (ext_blob_ptr == nullptr)) {
+                OPENVINO_THROW("Get tensor has no allocated memory");
+            }
+
+            cpu_convert(intr_blob_ptr,
+                        ext_blob_ptr,
+                        srcPrec,
+                        InferenceEngine::details::convertPrecision(aux_tensor.get_element_type()),
+                        intr_blob.GetDescWithType<BlockedMemoryDesc>()->getPaddedElementsCount());
+            continue;
+        }
 
         // That is the same memory. No need to copy
         if (ext_blob_ptr == intr_blob_ptr) continue;
@@ -988,7 +1105,7 @@ void Graph::PullOutputData(BlobMap &out) {
     }
 }
 
-void Graph::InferStatic(InferRequestBase* request) {
+void Graph::InferStatic(SyncInferRequest* request) {
     dnnl::stream stream(getEngine());
 
     for (const auto& node : executableGraphNodes) {
@@ -996,7 +1113,7 @@ void Graph::InferStatic(InferRequestBase* request) {
         PERF(node, getConfig().collectPerfCounters);
 
         if (request)
-            request->ThrowIfCanceled();
+            request->throw_if_canceled();
         ExecuteNode(node, stream);
     }
 }
@@ -1197,7 +1314,7 @@ public:
 } // namespace
 
 
-void Graph::InferDynamic(InferRequestBase* request) {
+void Graph::InferDynamic(SyncInferRequest* request) {
     dnnl::stream stream(getEngine());
 
     std::set<size_t> syncIndsWorkSet;
@@ -1225,7 +1342,7 @@ void Graph::InferDynamic(InferRequestBase* request) {
             PERF(node, getConfig().collectPerfCounters);
 
             if (request)
-                request->ThrowIfCanceled();
+                request->throw_if_canceled();
             ExecuteNode(node, stream);
         }
     }
@@ -1244,7 +1361,7 @@ inline void Graph::ExecuteNode(const NodePtr& node, const dnnl::stream& stream) 
     DEBUG_LOG(*node);
 }
 
-void Graph::Infer(InferRequestBase* request) {
+void Graph::Infer(SyncInferRequest* request) {
     if (!IsReady()) {
         IE_THROW() << "Wrong state of the ov::intel_cpu::Graph. Topology is not ready.";
     }
@@ -1347,30 +1464,27 @@ void Graph::SortTopologically() {
     }
 }
 
-void Graph::GetPerfData(std::map<std::string, InferenceEngine::InferenceEngineProfileInfo> &perfMap) const {
-    unsigned i = 0;
-    std::function<void(std::map<std::string, InferenceEngine::InferenceEngineProfileInfo> &, const NodePtr&)>
-            getPerfMapFor = [&](std::map<std::string, InferenceEngine::InferenceEngineProfileInfo> &perfMap, const NodePtr& node) {
-        InferenceEngine::InferenceEngineProfileInfo &pc = perfMap[node->getName()];
-        pc.execution_index = i++;
-        // TODO: Why time counter is signed?
-        pc.cpu_uSec = pc.realTime_uSec = (long long) node->PerfCounter().avg();
-        pc.status = pc.cpu_uSec > 0 ? InferenceEngine::InferenceEngineProfileInfo::EXECUTED
-                                    : InferenceEngine::InferenceEngineProfileInfo::NOT_RUN;
-        std::string pdType = node->getPrimitiveDescriptorType();
-        size_t typeLen = sizeof(pc.exec_type) / sizeof(pc.exec_type[0]);
-        pdType.copy(pc.exec_type, typeLen, 0);
-        size_t layerTypeLen = sizeof(pc.layer_type) / sizeof(pc.layer_type[0]);
-        node->typeStr.copy(pc.layer_type, layerTypeLen, 0);
+void Graph::GetPerfData(std::vector<ov::ProfilingInfo>& perfMap) const {
+    std::function<void(std::vector<ov::ProfilingInfo>&, const NodePtr&)> getPerfMapFor =
+        [&](std::vector<ov::ProfilingInfo>& perfMap, const NodePtr& node) {
+            ov::ProfilingInfo pc;
+            pc.node_name = node->getName();
+            // pc.execution_index = i++;
+            uint64_t avg_time = node->PerfCounter().avg();
+            pc.cpu_time = pc.real_time = std::chrono::microseconds(avg_time);
+            pc.status = avg_time > 0 ? ov::ProfilingInfo::Status::EXECUTED : ov::ProfilingInfo::Status::NOT_RUN;
+            pc.exec_type = node->getPrimitiveDescriptorType();
+            pc.node_type = node->typeStr;
+            perfMap.emplace_back(pc);
 
-        for (auto& fusedNode : node->fusedWith) {
-            getPerfMapFor(perfMap, fusedNode);
-        }
+            for (auto& fusedNode : node->fusedWith) {
+                getPerfMapFor(perfMap, fusedNode);
+            }
 
-        for (auto& mergedWith : node->mergedWith) {
-            getPerfMapFor(perfMap, mergedWith);
-        }
-    };
+            for (auto& mergedWith : node->mergedWith) {
+                getPerfMapFor(perfMap, mergedWith);
+            }
+        };
 
     for (size_t i = 0; i < graphNodes.size(); i++) {
         if (graphNodes[i]->isConstant())
