@@ -85,7 +85,7 @@ namespace {
     }
 
     const std::vector<ov::AnyMap> autoConfigs = {
-        {ov::device::priorities(ov::test::utils::DEVICE_CPU)}
+        {ov::device::priorities(ov::test::utils::DEVICE_TEMPLATE)}
     };
 
     INSTANTIATE_TEST_SUITE_P(smoke_Auto_CachingSupportCase_CPU, CompileModelCacheTestBase,
@@ -116,7 +116,7 @@ namespace {
                             CompileModelCacheTestBase::getTestCaseName);
 
     const std::vector<ov::AnyMap> LoadFromFileConfigs = {
-        {ov::device::priorities(ov::test::utils::DEVICE_CPU)},
+        {ov::device::priorities(ov::test::utils::DEVICE_TEMPLATE)},
         {ov::device::priorities(ov::test::utils::DEVICE_GPU), ov::hint::performance_mode(ov::hint::PerformanceMode::THROUGHPUT)},
         {ov::device::priorities(ov::test::utils::DEVICE_GPU), ov::hint::performance_mode(ov::hint::PerformanceMode::LATENCY)}
     };
@@ -141,10 +141,10 @@ namespace {
         return std::vector<std::pair<ov::AnyMap, std::string>>{
             std::make_pair(ov::AnyMap{{ov::device::priorities(ov::test::utils::DEVICE_GPU)}}, "blob"),
             std::make_pair(
-                ov::AnyMap{{ov::device::priorities(ov::test::utils::DEVICE_GPU, ov::test::utils::DEVICE_CPU)}},
+                ov::AnyMap{{ov::device::priorities(ov::test::utils::DEVICE_GPU, ov::test::utils::DEVICE_TEMPLATE)}},
                 "blob"),
             std::make_pair(
-                ov::AnyMap{{ov::device::priorities(ov::test::utils::DEVICE_CPU, ov::test::utils::DEVICE_GPU)}},
+                ov::AnyMap{{ov::device::priorities(ov::test::utils::DEVICE_TEMPLATE, ov::test::utils::DEVICE_GPU)}},
                 "blob")};
     };
 

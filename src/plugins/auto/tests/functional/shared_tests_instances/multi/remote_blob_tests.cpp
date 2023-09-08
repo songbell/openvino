@@ -8,7 +8,7 @@
 #include "common_test_utils/test_constants.hpp"
 
 const std::vector<DevicesNamesAndSupportTuple> device_names_and_support_for_remote_blobs {
-        {{CPU}, false, {}}, // CPU via MULTI
+    {{ov::test::utils::DEVICE_TEMPLATE}, false, {}},  // TEMPLATE via MULTI
 };
 
 INSTANTIATE_TEST_SUITE_P(smoke_Multi_RemoteBlobCPU, MultiDevice_SupportTest,

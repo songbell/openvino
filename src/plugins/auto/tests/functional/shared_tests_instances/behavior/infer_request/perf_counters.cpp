@@ -32,8 +32,7 @@ TEST_P(InferRequestPerfCountersTest, CheckOperationInPerfMap) {
 }
 
 const std::vector<std::map<std::string, std::string>> Autoconfigs = {
-        {{ MULTI_CONFIG_KEY(DEVICE_PRIORITIES), ov::test::utils::DEVICE_CPU}},
-        {{ MULTI_CONFIG_KEY(DEVICE_PRIORITIES), std::string(ov::test::utils::DEVICE_CPU) + "," + ov::test::utils::DEVICE_GPU}}
+        {{ MULTI_CONFIG_KEY(DEVICE_PRIORITIES), ov::test::utils::DEVICE_TEMPLATE}}
 };
 
 INSTANTIATE_TEST_SUITE_P(smoke_Multi_BehaviorTests, InferRequestPerfCountersTest,

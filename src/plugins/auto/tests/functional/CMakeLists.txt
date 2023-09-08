@@ -13,8 +13,6 @@ ov_add_test_target(
         ROOT ${CMAKE_CURRENT_SOURCE_DIR}
         DEPENDENCIES
             openvino_auto_plugin
-            openvino_intel_cpu_plugin
-            openvino_intel_gpu_plugin
         LINK_LIBRARIES
             openvino::funcSharedTests
             openvino::runtime::dev
