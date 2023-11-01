@@ -51,6 +51,7 @@ REGISTER_CPU(activation);
 REGISTER_CPU(reorder);
 REGISTER_CPU(broadcast);
 REGISTER_CPU(tile);
+REGISTER_CPU(rpe);
 
 #undef REGISTER_CPU
 

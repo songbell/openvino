@@ -52,6 +52,7 @@
 #include "transformations/fp16_compression/convert_compression_only_to_legacy.hpp"
 #include "transformations/fp16_compression/mark_decompression_convert_constant_folding.hpp"
 #include "transformations/common_optimizations/common_optimizations.hpp"
+#include "transformations/common_optimizations/fuse_rotary_positional_embeddings.hpp"
 #include "transformations/common_optimizations/lin_op_sequence_fusion.hpp"
 #include "transformations/common_optimizations/weights_dequantize_to_fake_quantize.hpp"
 #include "transformations/common_optimizations/convert_quantize_dequantize.hpp"
@@ -502,6 +503,12 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
             });
         }
 
+        manager.run_passes(func);
+    }
+        // RPE pass
+    {
+        ov::pass::Manager manager;
+        manager.register_pass<ov::pass::RPE_Fusion>();
         manager.run_passes(func);
     }
 
