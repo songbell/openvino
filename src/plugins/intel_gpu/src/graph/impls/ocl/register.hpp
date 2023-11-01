@@ -179,6 +179,7 @@ REGISTER_OCL(gather_nonzero);
 REGISTER_OCL(eye);
 REGISTER_OCL(unique_count);
 REGISTER_OCL(unique_gather);
+REGISTER_OCL(rpe);
 
 #undef REGISTER_OCL
 
