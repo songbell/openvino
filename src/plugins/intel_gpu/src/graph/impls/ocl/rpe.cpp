@@ -28,7 +28,9 @@ struct rpe_impl : typed_primitive_impl_ocl<rpe> {
         auto params = get_default_params<kernel_selector::rpe_params>(impl_param);
         auto optional_params = get_default_optional_params<kernel_selector::rpe_optional_params>(impl_param.get_program());
 
-        //param = convert_dim_vector(primitive->shift);
+        params.inputs.push_back(convert_data_tensor(impl_param.get_input_layout(1)));
+        params.inputs.push_back(convert_data_tensor(impl_param.get_input_layout(2)));
+        params.axis = primitive->axis;
 
         return {params, optional_params};
     }

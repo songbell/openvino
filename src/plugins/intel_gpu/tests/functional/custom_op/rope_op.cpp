@@ -19,8 +19,8 @@ using namespace ::testing;
 namespace ov {
 namespace test {
 namespace intel_gpu {
-
-static void name_node_and_output(const std::shared_ptr<Node>& op, const std::string& name) {
+void name_node_and_output(const std::shared_ptr<Node>& op, const std::string& name);
+void name_node_and_output(const std::shared_ptr<Node>& op, const std::string& name) {
     op->set_friendly_name(name);
     op->output(0).set_names({name});
 }
