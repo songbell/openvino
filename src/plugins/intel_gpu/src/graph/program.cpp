@@ -610,6 +610,9 @@ void program::pre_optimize_graph(bool is_internal) {
 
     // Mark operations that might be skipped at runtime as can_be_optimized.
     apply_opt_pass<mark_runtime_skippable_nodes>();
+
+    // Add sync nodes to FC
+    apply_opt_pass<add_tensor_parallel_opt>();
 }
 
 void program::post_optimize_graph(bool is_internal) {

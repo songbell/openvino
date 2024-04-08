@@ -16,6 +16,7 @@ void register_implementations() {
     REGISTER_COMMON(input_layout);
     REGISTER_COMMON(loop);
     REGISTER_COMMON(prior_box);
+    REGISTER_COMMON(sync_tensor);
 }
 
 }  // namespace common

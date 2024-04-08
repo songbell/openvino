@@ -402,4 +402,12 @@ private:
     void run(program& p) override;
 };
 
+class add_tensor_parallel_opt : public base_pass {
+public:
+    add_tensor_parallel_opt() : base_pass("enable tensor parallel") {}
+
+private:
+    void run(program& p) override;
+};
+
 }  // namespace cldnn
