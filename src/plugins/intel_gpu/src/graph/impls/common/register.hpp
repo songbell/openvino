@@ -9,7 +9,6 @@
 #include "intel_gpu/primitives/data.hpp"
 #include "intel_gpu/primitives/input_layout.hpp"
 #include "intel_gpu/primitives/prior_box.hpp"
-#include "intel_gpu/primitives/sync_tensor.hpp"
 
 
 namespace cldnn {
@@ -28,7 +27,6 @@ REGISTER_COMMON(data);
 REGISTER_COMMON(input_layout);
 REGISTER_COMMON(loop);
 REGISTER_COMMON(prior_box);
-REGISTER_COMMON(sync_tensor);
 
 #undef REGISTER_COMMON
 

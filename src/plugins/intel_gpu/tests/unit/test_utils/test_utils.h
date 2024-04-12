@@ -8,6 +8,7 @@
 
 #include "openvino/core/type/float16.hpp"
 
+#include <intel_gpu/runtime/device_query.hpp>
 #include <intel_gpu/runtime/memory.hpp>
 #include <intel_gpu/runtime/tensor.hpp>
 #include <intel_gpu/runtime/engine.hpp>
@@ -48,7 +49,7 @@
 
 namespace tests {
 
-std::shared_ptr<cldnn::engine> create_test_engine();
+std::shared_ptr<cldnn::engine> create_test_engine(std::string device_id = "0");
 cldnn::engine& get_test_engine();
 cldnn::stream_ptr get_test_stream_ptr(cldnn::ExecutionConfig cfg);
 cldnn::stream_ptr get_test_stream_ptr();

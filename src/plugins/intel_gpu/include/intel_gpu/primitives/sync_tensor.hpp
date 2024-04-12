@@ -19,7 +19,6 @@ struct sync_tensor : public primitive_base<sync_tensor> {
     /// @param inputq, inputk, inputv inputs of sync_tensor.
     sync_tensor(const primitive_id& id,
                    const input_info& sync_input,
-                   // to be added to support more inputs
                    const padding& output_padding = padding())
         : primitive_base(id, {sync_input},
         {output_padding})

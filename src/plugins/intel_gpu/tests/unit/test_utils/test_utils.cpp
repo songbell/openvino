@@ -301,8 +301,10 @@ cldnn::ExecutionConfig get_test_default_config(const cldnn::engine& engine,
     return config;
 }
 
-std::shared_ptr<cldnn::engine> create_test_engine() {
-    auto ret = cldnn::engine::create(engine_types::ocl, runtime_types::ocl);
+std::shared_ptr<cldnn::engine> create_test_engine(std::string device_id) {
+    cldnn::device_query device_query(engine_types::ocl, runtime_types::ocl);
+    auto device_map = device_query.get_available_devices();
+    auto ret = cldnn::engine::create(engine_types::ocl, runtime_types::ocl, device_map.at(device_id));
 #ifdef ENABLE_ONEDNN_FOR_GPU
     if (ret->get_device_info().supports_immad)
         ret->create_onednn_engine({});

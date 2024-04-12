@@ -22,13 +22,13 @@ struct data : public primitive_base<data> {
     /// @param id This primitive id.
     /// @param mem @ref memory object which contains data.
     /// @note If memory is attached by memory::attach(), the attached buffer should be valid till network build.
-    data(const primitive_id& id, memory::ptr mem)
+    data(const primitive_id& id, memory::ptr mem, bool need_buffer_transimt = false)
         : primitive_base(id, {}, {padding()}), mem(std::move(mem)) {}
 
     /// @brief @ref memory object which contains data.
     /// @note If memory is attached by memory::attach(), the attached buffer should be valid till network build.
     memory::ptr mem;
-
+    bool m_need_buffer_copy = false;
     size_t hash() const override {
         size_t seed = primitive::hash();
         seed = hash_combine(seed, id);

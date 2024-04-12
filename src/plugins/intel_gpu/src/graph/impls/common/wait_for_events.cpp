@@ -35,6 +35,10 @@ public:
     std::vector<layout> get_internal_buffer_layouts() const override { return {}; }
 
     event::ptr execute(const std::vector<event::ptr>& events, primitive_inst& instance) override {
+        auto prim = instance.get_typed_desc<data>();
+        if (prim->m_need_buffer_copy) {
+            // translate memory here
+        }
         auto& stream = instance.get_network().get_stream();
 
         return events.empty() ? stream.create_user_event(true)

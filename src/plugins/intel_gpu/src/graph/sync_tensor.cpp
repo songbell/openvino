@@ -33,7 +33,7 @@ void sync_tensor_inst::update_output_memory() {
     if (!can_be_optimized())
         return;
 
-    //_outputs = input_memory();
+    _outputs = {input_memory_ptr()}; // to be optimized further
     _mem_allocated = false;
 }
 } // namespace cldnn
