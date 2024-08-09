@@ -154,7 +154,11 @@ void SyncInferRequest::sub_streams_infer() {
         for (size_t i = 0; i < requests_num; i++) {
             for (auto& input : inputs) {
                 auto tensor = get_tensor(input);
-                requests[i]->set_tensor(input, tensor);
+                ov::SoPtr<ov::ITensor> peer_tensor;
+                if (std::dynamic_pointer_cast<RemoteTensorImpl>(tensor._ptr) 
+                    && requests[i]->get_compiled_model()->get_context()->get_device_name() != std::dynamic_pointer_cast<RemoteTensorImpl>(tensor._ptr)->get_device_name())
+                    peer_tensor = get_peer_tensor(input);
+                requests[i]->set_tensor(input, peer_tensor? peer_tensor : tensor);
             }
 
             requests[i]->set_callback([message](const std::exception_ptr& ptr) {
@@ -203,7 +207,17 @@ void SyncInferRequest::set_tensor(const ov::Output<const ov::Node>& port, const 
     const auto& port_info = find_port(port);
     size_t port_index = port_info.idx;
     const auto& shape = port.get_partial_shape();
-
+    auto remote_user = std::dynamic_pointer_cast<RemoteTensorImpl>(tensor._ptr);
+    ov::SoPtr<ov::ITensor> peer_remote_user = remote_user;
+    if (remote_user) {
+        auto requests = m_asyncRequest->getSubInferRequest();
+        for (auto& iter : requests) {
+            auto context = iter->get_compiled_model()->get_context();
+            if (context->get_device_name() == remote_user->get_device_name())
+                continue;
+            peer_remote_user = context->create_tensor(tensor->get_element_type(), tensor->get_shape());
+        }
+    }
     OPENVINO_ASSERT(tensor != nullptr, "[GPU] Failed to set empty tensor to port with index: \'", port_index, "\'");
     OPENVINO_ASSERT(port.get_element_type() == tensor->get_element_type(),
                     "[GPU] Mismatch tensor and port type: ", port.get_element_type(), " vs ", tensor->get_element_type());
@@ -240,6 +254,10 @@ void SyncInferRequest::set_tensor(const ov::Output<const ov::Node>& port, const 
     bool is_input = port_info.type == ov::ISyncInferRequest::FoundPort::Type::INPUT;
     if (is_input) {
         update_tensors_maps(port_index, m_user_inputs, m_plugin_inputs, tensor);
+        auto m_plugin_inputs_wrapper = std::unordered_map<size_t, TensorWrapper>();
+        if (peer_remote_user) {
+            update_tensors_maps(port_index, m_peer_user_inputs, m_plugin_inputs_wrapper, peer_remote_user);
+        }
     } else {
         update_tensors_maps(port_index, m_user_outputs, m_plugin_outputs, tensor);
     }
@@ -277,6 +295,13 @@ ov::SoPtr<ov::ITensor> SyncInferRequest::get_tensor(const ov::Output<const ov::N
         OPENVINO_ASSERT(m_user_outputs.count(port_index) == 1, "[GPU] Output tensor with index ", port_index, " is not found");
         return { m_user_outputs.at(port_index).ptr, nullptr };
     }
+}
+
+ov::SoPtr<ov::ITensor> SyncInferRequest::get_peer_tensor(const ov::Output<const ov::Node>& port) const {
+    const auto& port_info = find_port(port);
+    size_t port_index = port_info.idx;
+    OPENVINO_ASSERT(m_peer_user_inputs.count(port_index) == 1, "[GPU] Input tensor with index ", port_index, " is not found");
+    return { m_peer_user_inputs.at(port_index).ptr, nullptr };
 }
 
 void SyncInferRequest::check_tensors() const {

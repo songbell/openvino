@@ -56,7 +56,7 @@ public:
     void set_tensors_impl(const ov::Output<const ov::Node> port, const std::vector<ov::SoPtr<ov::ITensor>>& tensors) override;
 
     ov::SoPtr<ov::ITensor> get_tensor(const ov::Output<const ov::Node>& port) const override;
-
+    ov::SoPtr<ov::ITensor> get_peer_tensor(const ov::Output<const ov::Node>& port) const;
     void set_task_executor(const std::shared_ptr<ov::threading::ITaskExecutor>& task_executor);
     void setup_stream_graph();
     void enqueue_notify();
@@ -76,7 +76,7 @@ private:
 
     std::unordered_map<size_t, TensorWrapper> m_user_inputs;
     std::unordered_map<size_t, TensorWrapper> m_user_outputs;
-
+    std::unordered_map<size_t, TensorWrapper> m_peer_user_inputs;
     std::unordered_map<size_t, TensorWrapper> m_plugin_inputs;
     std::unordered_map<size_t, TensorWrapper> m_plugin_outputs;
 
