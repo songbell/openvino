@@ -35,21 +35,24 @@
 namespace ov {
 namespace intel_gpu {
 
-Graph::Graph(std::shared_ptr<ov::Model> model, const RemoteContextImpl::Ptr& context, const ExecutionConfig& config, uint16_t stream_id)
+Graph::Graph(std::shared_ptr<ov::Model> model, const RemoteContextImpl::Ptr& context, const ExecutionConfig& config, uint16_t stream_id,
+            const std::shared_ptr<SubMemoryManager> sub_memory_manager)
     : m_context(context)
     , m_config(config)
     , m_stream_id(stream_id) {
-    auto program_builder = std::make_shared<ProgramBuilder>(model, get_engine(), config, false);
-    m_config = program_builder->get_config();
+    if (!m_config.enableSubStreams) {
+        auto program_builder = std::make_shared<ProgramBuilder>(model, get_engine(), config, false);
+        m_config = program_builder->get_config();
+        m_sub_memory_manager = sub_memory_manager;
+        build(program_builder->get_compiled_program());
 
-    build(program_builder->get_compiled_program());
-
-    primitiveIDs = program_builder->primitive_ids;
-    inputPrimitiveIDs = program_builder->inputPrimitiveIDs;
-    prevPrimitiveIDs = program_builder->prevPrimitiveIDs;
-    profilingIDs = program_builder->profiling_ids;
-    perfMap = program_builder->perfMap;
-    m_input_layouts = program_builder->get_input_layouts();
+        primitiveIDs = program_builder->primitive_ids;
+        inputPrimitiveIDs = program_builder->inputPrimitiveIDs;
+        prevPrimitiveIDs = program_builder->prevPrimitiveIDs;
+        profilingIDs = program_builder->profiling_ids;
+        perfMap = program_builder->perfMap;
+        m_input_layouts = program_builder->get_input_layouts();
+    }
 }
 
 Graph::Graph(cldnn::BinaryInputBuffer &ib, const RemoteContextImpl::Ptr& context, const ExecutionConfig& config, uint16_t stream_id)
@@ -114,6 +117,65 @@ Graph::Graph(std::shared_ptr<Graph> graph, uint16_t stream_id)
     build(graph->get_network()->get_program());
 }
 
+Graph::~Graph() {
+    GPU_DEBUG_IF(cldnn::debug_configuration::get_instance()->host_time_profiling) {
+        const auto log_level = cldnn::debug_configuration::get_instance()->host_time_profiling;
+
+        auto get_time_str = [](int64_t time_mcs, int64_t iters_num = 1) {
+            double time = static_cast<double>(time_mcs);
+            time /= iters_num;
+
+            std::stringstream ss;
+            std::string resolution = " mcs";
+            if (time > 1000.0) {
+                resolution = " ms";
+                time /= 1000.0;
+            }
+            ss << std::fixed << std::setprecision(2) << time << resolution;
+
+            return ss.str();
+        };
+
+        auto print_entry = [this, &get_time_str, &log_level](std::string name, HostTimeProfilingEntry& entry, int64_t iters_num = 1) {
+            if (log_level == 1) {
+                GPU_DEBUG_COUT << "[stream_id=" << m_stream_id << "] " << name << " infer enqueue host time: "
+                               << get_time_str(entry.enqueue, iters_num) << std::endl;
+            } else if (log_level >= 2) {
+                auto total_time = entry.inputs_processing + entry.enqueue + entry.wait + entry.outputs_processing;
+
+                GPU_DEBUG_COUT << "[stream_id=" << m_stream_id << "] " << name << " infer host time: "
+                               << get_time_str(total_time, iters_num) << std::endl;
+                GPU_DEBUG_COUT << " - " << " Inputs processing: " << get_time_str(entry.inputs_processing, iters_num) << std::endl;
+                GPU_DEBUG_COUT << " - " << " Enqueue: " << get_time_str(entry.enqueue, iters_num) << std::endl;
+                GPU_DEBUG_COUT << " - " << " Wait: " << get_time_str(entry.wait, iters_num) << std::endl;
+                GPU_DEBUG_COUT << " - " << " Outputs processing: " << get_time_str(entry.outputs_processing, iters_num) << std::endl;
+            }
+        };
+
+        if (host_exec_times.size() >= 1) {
+            print_entry("First", host_exec_times[0], 1);
+        }
+
+        if (host_exec_times.size() >= 2) {
+            HostTimeProfilingEntry avg;
+
+            const auto begin = std::begin(host_exec_times) + 1;
+            const auto end = std::end(host_exec_times);
+            avg.inputs_processing = std::accumulate(begin, end, 0,
+                [](int64_t sum, const HostTimeProfilingEntry& entry) { return sum + entry.inputs_processing; });
+            avg.enqueue = std::accumulate(begin, end, 0,
+                [](int64_t sum, const HostTimeProfilingEntry& entry) { return sum + entry.enqueue; });
+            avg.wait = std::accumulate(begin, end, 0,
+                [](int64_t sum, const HostTimeProfilingEntry& entry) { return sum + entry.wait; });
+            avg.outputs_processing = std::accumulate(begin, end, 0,
+                [](int64_t sum, const HostTimeProfilingEntry& entry) { return sum + entry.outputs_processing; });
+
+            const auto iters_num = host_exec_times.size() - 1;
+            print_entry("Avg", avg, iters_num);
+        }
+    }
+}
+
 void Graph::build(std::shared_ptr<cldnn::program> program) {
     OV_ITT_SCOPED_TASK(itt::domains::intel_gpu_plugin, "Graph::build");
 
@@ -121,9 +183,9 @@ void Graph::build(std::shared_ptr<cldnn::program> program) {
     if (external_queue) {
         OPENVINO_ASSERT(m_config.get_property(ov::num_streams) == 1, "[GPU] Throughput streams can't be used with shared queue!");
         const auto &engine = program->get_engine();
-        m_network = std::make_shared<cldnn::network>(program, engine.create_stream(m_config, external_queue), m_stream_id);
+        m_network = std::make_shared<cldnn::network>(program, engine.create_stream(m_config, external_queue), m_stream_id, m_sub_memory_manager);
     } else {
-        m_network = std::make_shared<cldnn::network>(program, m_stream_id);
+        m_network = std::make_shared<cldnn::network>(program, m_stream_id, m_sub_memory_manager);
     }
 
     GPU_DEBUG_GET_INSTANCE(debug_config);

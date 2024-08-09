@@ -20,6 +20,8 @@
 #include "intel_gpu/runtime/internal_properties.hpp"
 #include "intel_gpu/runtime/itt.hpp"
 #include "intel_gpu/runtime/debug_configuration.hpp"
+#include "intel_gpu/plugin/async_infer_request.hpp"
+#include "openvino/runtime/threading/cpu_message.hpp"
 
 #include <algorithm>
 #include <iterator>
@@ -113,10 +115,60 @@ SyncInferRequest::SyncInferRequest(const std::shared_ptr<const CompiledModel>& c
 
 void SyncInferRequest::infer() {
     OV_ITT_SCOPED_TASK(itt::domains::intel_gpu_plugin, "SyncInferRequest::infer");
+    auto message = ov::threading::message_manager();
+    if (m_asyncRequest->m_has_sub_infers) {
+        message->server_wait();
+        ov::threading::MessageInfo msg_info;
+        msg_info.msg_type = ov::threading::MsgType::START_INFER;
+        ov::threading::Task task = [&] {
+            SyncInferRequest::sub_streams_infer();
+        };
+        msg_info.task = std::move(task);
+        message->send_message(msg_info);
+        message->infer_wait();
+        // std::cout << "------ infer end -----\n";
+        return;
+    }
+
     setup_stream_graph();
     std::lock_guard<std::mutex> lk(m_graph->get_mutex());
     enqueue();
     wait();
+}
+
+void SyncInferRequest::sub_streams_infer() {
+    // sub streams infer
+    auto message = ov::threading::message_manager();
+    auto requests = m_asyncRequest->getSubInferRequest();
+    size_t requests_num = requests.size();
+    auto inputs = get_inputs();
+    auto outputs = get_outputs();
+    // auto inputs = get_inputs();
+    // auto outputs = get_outputs();
+
+    if (requests.size() > 0) {
+        for (const auto& output : outputs) {
+            auto tensor = requests[0]->get_tensor(output);
+            set_tensor(output, tensor);
+        }
+        for (size_t i = 0; i < requests_num; i++) {
+            for (auto& input : inputs) {
+                auto tensor = get_tensor(input);
+                requests[i]->set_tensor(input, tensor);
+            }
+
+            requests[i]->set_callback([message](const std::exception_ptr& ptr) {
+                // std::cout << "set_callback------ " << i << "\n";
+                ov::threading::MessageInfo msg_info;
+                msg_info.msg_type = ov::threading::MsgType::CALL_BACK;
+                message->send_message(msg_info);
+            });
+        }
+        for (size_t i = 0; i < requests_num; i++) {
+            // std::cout << "start_async : " << i << "\n";
+            requests[i]->start_async();
+        }
+    }
 }
 
 std::vector<ov::ProfilingInfo> SyncInferRequest::get_profiling_info() const {
@@ -125,11 +177,25 @@ std::vector<ov::ProfilingInfo> SyncInferRequest::get_profiling_info() const {
 }
 
 std::vector<ov::SoPtr<ov::IVariableState>> SyncInferRequest::query_state() const {
+    if (m_asyncRequest->m_has_sub_infers) {
+        auto requests = m_asyncRequest->getSubInferRequest();
+        std::vector<ov::SoPtr<ov::IVariableState>> states;
+        for (auto request : requests) {
+            auto cur = request->query_state();
+            states.insert(states.end(), cur.begin(), cur.end());
+        }
+        return states;
+    }
     std::vector<ov::SoPtr<ov::IVariableState>> ret{};
     for (const auto& pair : m_variables) {
         ret.emplace_back(pair.second, nullptr);
     }
     return ret;
+}
+
+void SyncInferRequest::set_async_request(ov::intel_gpu::AsyncInferRequest* asyncRequest) {
+    m_asyncRequest = asyncRequest;
+    // m_asyncRequest->
 }
 
 void SyncInferRequest::set_tensor(const ov::Output<const ov::Node>& port, const ov::SoPtr<ov::ITensor>& tensor) {
@@ -243,6 +309,9 @@ void SyncInferRequest::wait_notify() {
 }
 
 void SyncInferRequest::enqueue() {
+    int64_t network_enqueue_time = 0;
+    auto enqueue_start = std::chrono::high_resolution_clock::now();
+
     // set input and output memory from request blob maps
     // into the network object primitives
     std::vector<cldnn::event::ptr> dependencies;
@@ -279,7 +348,10 @@ void SyncInferRequest::enqueue() {
     network->set_shape_predictor(m_shape_predictor);
 
     m_internal_outputs.clear();
+
+    auto network_enqueue_start = std::chrono::high_resolution_clock::now();
     m_internal_outputs = network->execute(dependencies);
+    auto network_enqueue_end = std::chrono::high_resolution_clock::now();
 
     // If dump layers path is set, only runs first inference.
     GPU_DEBUG_GET_INSTANCE(debug_config);
@@ -287,19 +359,42 @@ void SyncInferRequest::enqueue() {
         GPU_DEBUG_INFO << "Only run first inference to dump layers." << std::endl;
         exit(0);
     }
+
+    auto enqueue_end = std::chrono::high_resolution_clock::now();
+    GPU_DEBUG_IF(cldnn::debug_configuration::get_instance()->host_time_profiling) {
+        network_enqueue_time = std::chrono::duration_cast<std::chrono::microseconds>(network_enqueue_end - network_enqueue_start).count();
+
+        const uint64_t total_time = std::chrono::duration_cast<std::chrono::microseconds>(enqueue_end - enqueue_start).count();
+        const uint64_t inputs_processing = total_time - network_enqueue_time;
+
+        HostTimeProfilingEntry entry;
+        entry.inputs_processing = inputs_processing;
+        entry.enqueue = network_enqueue_time;
+
+        m_graph->host_exec_times.push_back(entry);
+    }
 }
 
 void SyncInferRequest::wait() {
     OV_ITT_SCOPED_TASK(itt::domains::intel_gpu_plugin, "SyncInferRequest::wait");
     OPENVINO_ASSERT(!m_internal_outputs.empty(), "[GPU] Inference was not started!\n");
 
+    int64_t sync_total_time = 0;
+    auto wait_start = std::chrono::high_resolution_clock::now();
+
     auto& network = *m_graph->get_network();
 
     // wait for completion & collect outputs as requested by the model
     // for in_order_queue, it is enough to call finish only once
     bool do_sync_per_output = (network.get_stream().get_queue_type() == QueueTypes::in_order) ? false : true;
-    if (!do_sync_per_output)
+    if (!do_sync_per_output) {
+        auto sync_start = std::chrono::high_resolution_clock::now();
         network.get_stream().finish();
+        auto sync_end = std::chrono::high_resolution_clock::now();
+
+        GPU_DEBUG_IF(true)
+            sync_total_time = std::chrono::duration_cast<std::chrono::microseconds>(sync_end - sync_start).count();
+    }
 
     std::vector<cldnn::event::ptr> copy_events;
 
@@ -307,7 +402,14 @@ void SyncInferRequest::wait() {
         size_t port_idx = it.first;
         const auto& port = it.second;
         cldnn::primitive_id internal_name = m_output_names_map.at(port_idx);
-        auto output_memory = m_internal_outputs.at(internal_name).get_memory(do_sync_per_output);
+
+        auto sync_start = std::chrono::high_resolution_clock::now();
+        cldnn::memory::ptr output_memory = m_internal_outputs.at(internal_name).get_memory(do_sync_per_output);
+        auto sync_end = std::chrono::high_resolution_clock::now();
+        GPU_DEBUG_IF(do_sync_per_output) {
+            sync_total_time += std::chrono::duration_cast<std::chrono::microseconds>(sync_end - sync_start).count();
+        }
+
         auto output_layout = m_internal_outputs.at(internal_name).get_layout();
 
         if (output_memory) {
@@ -420,6 +522,17 @@ void SyncInferRequest::wait() {
     // finally collect profiling info
     if (m_enable_profiling) {
         m_graph->update_profiling_info();
+    }
+
+    auto wait_end = std::chrono::high_resolution_clock::now();
+    GPU_DEBUG_IF(cldnn::debug_configuration::get_instance()->host_time_profiling) {
+        auto& exec_time_info = m_graph->host_exec_times.back();
+
+        const uint64_t total_time = std::chrono::duration_cast<std::chrono::microseconds>(wait_end - wait_start).count();
+        const uint64_t outputs_processing_time = total_time - sync_total_time;
+
+        exec_time_info.wait = sync_total_time;
+        exec_time_info.outputs_processing = outputs_processing_time;
     }
 }
 

@@ -39,6 +39,7 @@
 #include "data_inst.h"
 #include "deconvolution_inst.h"
 #include "detection_output_inst.h"
+#include "fully_connected_inst.h"
 #include "generate_proposals_inst.h"
 #include "experimental_detectron_generate_proposals_single_image_inst.hpp"
 #include "input_layout_inst.h"
@@ -605,6 +606,9 @@ void program::pre_optimize_graph(bool is_internal) {
 
     // Mark operations that might be skipped at runtime as can_be_optimized.
     apply_opt_pass<mark_runtime_skippable_nodes>();
+
+    // add tp
+    //apply_opt_pass<add_required_all_reduce>();
 }
 
 void program::post_optimize_graph(bool is_internal) {
@@ -640,7 +644,6 @@ void program::post_optimize_graph(bool is_internal) {
 
     // update inner program input/output primitive mappings
     apply_opt_pass<update_inner_program_io_map>();
-
     // Recalculate processing order after all graph transformation to keep optimal primitives ordering
     // for OOO queue
     if (_config.get_property(ov::intel_gpu::queue_type) == QueueTypes::out_of_order)
@@ -699,16 +702,16 @@ void program::transfer_memory_to_device() {
             if (ov::shape_size(mem_layout.get_shape()) == 0)
                 continue;
 
+            auto engine = mem.get_engine();
             if (!mem_layout.compatible(data_node_layout)) {
                 std::string err_str("Node and memory layouts are incompatible, error occurred for " + node->id() + " node");
                 throw std::invalid_argument(err_str);
             }
 
-
             if (alloc_type == allocation_type::usm_host || alloc_type == allocation_type::usm_shared) {
                 GPU_DEBUG_LOG << "[" << data_node.id() << ": constant]" << std::endl;
                 // Allocate and transfer memory
-                auto device_mem = mem.get_engine()->allocate_memory(data_node_layout, allocation_type::usm_device, false);
+                auto device_mem = engine->allocate_memory(data_node_layout, allocation_type::usm_device, false);
                 device_mem->copy_from(get_stream(), mem);
                 data_node.attach_memory(device_mem);
                 GPU_DEBUG_LOG << "[" << data_node.id() << ": constant]" << std::endl;
