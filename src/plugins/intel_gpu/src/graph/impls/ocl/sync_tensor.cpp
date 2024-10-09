@@ -746,7 +746,7 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
                        std::string("rank[") + std::to_string(w_rank) + std::string("] sync_tensor wait events"),
                        true);
 
-
+        instance.sync_wait_times = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - start).count();
         auto sub_mem_mgr = instance.get_network().get_sub_mem_mgr();
         auto id = 0; //sub_mem_mgr->get_memory_id(w_rank);
         sub_mem_mgr->set_memory_used(id, w_rank);
