@@ -736,6 +736,9 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
         if (!is_all_reduce && all_gather_remote_dst.size() == 0) {
             all_gather_remote_dst.assign(w_size, nullptr);
         }
+        auto task_executor = instance.get_network().get_program()->get_task_executor();
+        ov::threading::Task task = [] {};
+        task_executor->run(task);
         auto start = perf_dump_start();
         if (!pass_through_events) {
             for (auto e : events) {
