@@ -111,6 +111,15 @@ bool is_user_cpu(const program_node* user) {
     return is_cpu;
 }
 
+std::pair<bool, std::string> is_any_input_sync_tensor(const program_node* node) {
+    auto deps = node->get_dependencies();
+    for (auto& iter : deps) {
+        if (iter.first->is_type<sync_tensor>())
+            return {true, iter.first->id()};
+    }
+    return {false, {}};
+}
+
 bool has_cpu_user_not_shape_of(const program_node* user) {
     if (user->can_be_optimized()) {
         auto users = user->get_users();
@@ -1186,6 +1195,23 @@ void primitive_inst::update_paddings() {
     }
 }
 
+void primitive_inst::do_runtime_extra_sync() {
+    OV_ITT_SCOPED_TASK(ov::intel_gpu::itt::domains::intel_gpu_plugin, openvino::itt::handle("do_runtime_extra_sync: " + id()));
+    GPU_DEBUG_GET_INSTANCE(debug_config);
+    if (can_be_optimized())
+        return;
+    // one of input is sync tensor
+    auto check_input = is_any_input_sync_tensor(_node);
+    if (check_input.first) {
+        std::cout << "bell debug: found dependency sync tensor: " << check_input.second << std::endl;
+        auto inst = std::dynamic_pointer_cast<sync_tensor_inst>(_network.get_primitive(check_input.second));
+        std::unique_lock<std::mutex> ul(inst->sync_mutex);
+        inst->sync_cv.wait(ul, [this]() {
+                return true;
+            });
+    }
+}
+
 void primitive_inst::do_runtime_skip_reorder() {
     OV_ITT_SCOPED_TASK(ov::intel_gpu::itt::domains::intel_gpu_plugin, openvino::itt::handle("do_runtime_skip_reorder: " + id()));
     GPU_DEBUG_GET_INSTANCE(debug_config);
@@ -1770,6 +1796,7 @@ event::ptr primitive_inst::execute(const std::vector<event::ptr>& events) {
             }
         }
     }
+    do_runtime_extra_sync();
     GPU_DEBUG_TRACE << id() << ": execute " << _impl->get_kernel_name() << " (is_dynamic=" << _impl->is_dynamic()
                     << ", "
                     << "can_be_optimized=" << can_be_optimized() << ")" << std::endl;

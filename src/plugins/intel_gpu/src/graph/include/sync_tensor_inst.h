@@ -6,6 +6,7 @@
 
 #include "intel_gpu/primitives/sync_tensor.hpp"
 #include "primitive_inst.h"
+#include <condition_variable>
 
 namespace cldnn {
 
@@ -59,6 +60,8 @@ public:
     typed_primitive_inst(network& network, const sync_tensor_node& desc);
     typed_primitive_inst(network& network) : parent(network) {}
     void update_output_memory() override;
+    std::mutex sync_mutex;
+    std::condition_variable sync_cv;
 
 protected:
     void on_execute() override;
