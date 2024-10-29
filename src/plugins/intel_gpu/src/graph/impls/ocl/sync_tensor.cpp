@@ -874,7 +874,6 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
     event::ptr execute_impl(const std::vector<event::ptr>& events, sync_tensor_inst& instance) override {
         OV_ITT_SCOPED_TASK(ov::intel_gpu::itt::domains::intel_gpu_plugin, "sync_tensor::execute_impl");
         auto& stream = instance.get_network().get_stream();
-        const bool pass_through_events = false;
 
         auto w_rank = instance.get_network().get_program()->get_config().subStreamExecConfig.get_rank()[0];
         auto w_size = instance.get_network().get_program()->get_config().get_context_for_tp().size();
@@ -889,18 +888,27 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
             if (all_reduce_add_solution)
                 all_reduce_solution = std::atoi(all_reduce_add_solution);
         }
-
+        auto task_executor = instance.get_network().get_program()->get_task_executor();
         auto start = perf_dump_start();
+        if (getenv("OV_TP_ENABLE_WAIT_FOR_PROFILE")) {
+            for (auto e : events) {
+                e->wait();
+            }
+            instance.sync_wait_times = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - start).count();
+        }
+
         perf_dump_done(start,
                        std::string("rank[") + std::to_string(w_rank) + std::string("] sync_tensor wait events"),
                        true);
-
         auto sub_mem_mgr = instance.get_network().get_sub_mem_mgr();
         auto id = 0;
         // auto id = sub_mem_mgr->get_memory_id(w_rank);
         sub_mem_mgr->set_memory_used(id, w_rank);
+        std::vector<cldnn::event::ptr> sync_events;
+        auto p2p_src_layout = instance.get_output_layout(0);
         auto start_1 = perf_dump_start();
         while (true) {
+            std::unique_lock<std::mutex> sync_lock(instance.sync_mutex);
             std::lock_guard<std::mutex> lock(sub_mem_mgr->_flagMutex);
             if (sub_mem_mgr->_use_count[id] == w_size) {
                 sub_mem_mgr->_use_count[id] = 0;
@@ -927,109 +935,109 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
         }
 
         perf_dump_done(start_1,
-                       std::string("rank[") + std::to_string(w_rank) + std::string("] sync_tensor wait data ready"),
-                       true);
+                    std::string("rank[") + std::to_string(w_rank) + std::string("] sync_tensor wait data ready"),
+                    true);
         gpu_p2p_helper& gpu_p2p_instance = get_p2p_instance();
         auto& ocl_stream = downcast<ocl::ocl_stream>(stream);
+        event::ptr sync_tensor_grouped_event;
         auto local_context = ocl_stream.get_engine().get_cl_context().get();
-        auto p2p_src_layout = instance.get_output_layout(0);
-        bool need_update_remote_mems = false;
-        if (is_all_reduce) {
-            OPENVINO_ASSERT(1 == instance.get_output_memorys().size(), "All reduce only has one output!");
-            if (all_reduce_solution == 2)
-                sub_mem_mgr->_memorys_table[id][w_rank].recv_bufs[0] = instance.get_output_memorys()[0];
-            else
-                sub_mem_mgr->_memorys_table[id][w_rank].recv_bufs[w_rank] = instance.get_output_memorys()[0];
-            sub_mem_mgr->_memorys_table[id][w_rank].output = instance.get_output_memorys()[0];
-            // Allocate or reuse buffer for P2P target, same shape with output[0]
-            p2p_src_layout = instance.get_output_layout(0);
-            need_update_remote_mems = update_internal_buffer(instance,
-                                                             sub_mem_mgr->_memorys_table[id][w_rank].recv_bufs,
-                                                             sub_mem_mgr->_memorys_table[id][w_rank].layout,
-                                                             p2p_src_layout,
-                                                             w_size,
-                                                             w_rank,
-                                                             all_reduce_solution);
-        } else {
-            OPENVINO_ASSERT(2 == instance.get_output_memorys().size(),
-                            "All gather need additional buffer for concat result!");
-            sub_mem_mgr->_memorys_table[id][w_rank].recv_bufs[w_rank] = instance.get_output_memorys()[1];
-            sub_mem_mgr->_memorys_table[id][w_rank].output = instance.get_output_memorys()[0];
-            // All gather doesn't need intermediate buffer at all.
-            p2p_src_layout = instance.get_output_layout(1);
-            auto tmp =
-                std::dynamic_pointer_cast<const ocl::gpu_buffer>(instance.get_output_memorys()[0])->get_buffer().get();
-            if (tmp != all_gather_current_dst) {
-                need_update_remote_mems = true;
-                all_gather_current_dst = tmp;
-            }
-        }
-        if (all_reduce_solution == 1)
-            sub_mem_mgr->_memorys_table[id][w_rank].recv_flag[w_rank] = true;
-        if (all_reduce_solution == 2) {
-            sub_mem_mgr->_memorys_table[id][w_rank].recv_flag[0] = true;
-            sub_mem_mgr->_memorys_table[id][w_rank].recv_flag_concat[0] = true;
-            sub_mem_mgr->_memorys_table[id][w_rank].add_flag_concat[0] = true;
-        } else {
-            sub_mem_mgr->_memorys_table[id][w_rank].flag = true;
-        }
-
-        // The mapped remote cl_mem will hold the original cl_mem, it should be released if the original cl_mem has been
-        // released, else it will cause gpu memory leak.
-        if (need_update_remote_mems) {
-            if (debug_enable) {
-                std::cout << "release_remote_mems: old_layout = "
-                          << sub_mem_mgr->_memorys_table[id][w_rank].layout.to_short_string()
-                          << ", new_layout = " << p2p_src_layout.to_short_string() << std::endl;
-            }
-        }
-
-        std::vector<cldnn::event::ptr> sync_events;
-        if (is_all_reduce && all_reduce_solution == 2) {
-            while (true) {
-                size_t wait_all_ouput_ready = 0;
-                for (int idx = 0; idx < static_cast<int>(w_size); idx++) {
-                    if (sub_mem_mgr->_memorys_table[id][idx].recv_flag[0] == true)
-                        wait_all_ouput_ready++;
-                }
-                if (wait_all_ouput_ready == w_size) {
-                    break;
+            ov::threading::Task blocked_p2p_operation = [&]() {
+            bool need_update_remote_mems = false;
+            if (is_all_reduce) {
+                OPENVINO_ASSERT(1 == instance.get_output_memorys().size(), "All reduce only has one output!");
+                if (all_reduce_solution == 2)
+                    sub_mem_mgr->_memorys_table[id][w_rank].recv_bufs[0] = instance.get_output_memorys()[0];
+                else
+                    sub_mem_mgr->_memorys_table[id][w_rank].recv_bufs[w_rank] = instance.get_output_memorys()[0];
+                sub_mem_mgr->_memorys_table[id][w_rank].output = instance.get_output_memorys()[0];
+                // Allocate or reuse buffer for P2P target, same shape with output[0]
+                p2p_src_layout = instance.get_output_layout(0);
+                need_update_remote_mems = update_internal_buffer(instance,
+                                                                sub_mem_mgr->_memorys_table[id][w_rank].recv_bufs,
+                                                                sub_mem_mgr->_memorys_table[id][w_rank].layout,
+                                                                p2p_src_layout,
+                                                                w_size,
+                                                                w_rank,
+                                                                all_reduce_solution);
+            } else {
+                std::cout << "bell debug in impl: " << instance.id() << std::endl;
+                OPENVINO_ASSERT(2 == instance.get_output_memorys().size(),
+                                "All gather need additional buffer for concat result!");
+                sub_mem_mgr->_memorys_table[id][w_rank].recv_bufs[w_rank] = instance.get_output_memorys()[1];
+                sub_mem_mgr->_memorys_table[id][w_rank].output = instance.get_output_memorys()[0];
+                // All gather doesn't need intermediate buffer at all.
+                p2p_src_layout = instance.get_output_layout(1);
+                auto tmp =
+                    std::dynamic_pointer_cast<const ocl::gpu_buffer>(instance.get_output_memorys()[0])->get_buffer().get();
+                if (tmp != all_gather_current_dst) {
+                    need_update_remote_mems = true;
+                    all_gather_current_dst = tmp;
                 }
             }
-            auto split_parts = [](int len, int n) {
-                int average = len / n;
-                std::vector<int> parts(n, average);
-                parts.back() = len - average * (n - 1);
-                return parts;
-            };
+            if (all_reduce_solution == 1)
+                sub_mem_mgr->_memorys_table[id][w_rank].recv_flag[w_rank] = true;
+            if (all_reduce_solution == 2) {
+                sub_mem_mgr->_memorys_table[id][w_rank].recv_flag[0] = true;
+                sub_mem_mgr->_memorys_table[id][w_rank].recv_flag_concat[0] = true;
+                sub_mem_mgr->_memorys_table[id][w_rank].add_flag_concat[0] = true;
+            } else {
+                sub_mem_mgr->_memorys_table[id][w_rank].flag = true;
+            }
 
-            auto output_layout = instance.get_output_layout(0);
-            ov::element::Type output_element_type = output_layout.data_type;
-            auto output_element_size = output_element_type.size();
-            auto output_shape = output_layout.get_shape();
-            auto sub_out_dim_vec = split_parts(output_shape[-1], w_size);
-            if (0) {
-                for (size_t iter = 0; iter < w_size; iter++) {
-                    std::cout << "sub_out_dim_vec[" << iter << "] " << sub_out_dim_vec[iter] << std::endl;
+            // The mapped remote cl_mem will hold the original cl_mem, it should be released if the original cl_mem has been
+            // released, else it will cause gpu memory leak.
+            if (need_update_remote_mems) {
+                if (debug_enable) {
+                    std::cout << "release_remote_mems: old_layout = "
+                            << sub_mem_mgr->_memorys_table[id][w_rank].layout.to_short_string()
+                            << ", new_layout = " << p2p_src_layout.to_short_string() << std::endl;
                 }
             }
-            auto output_height = ov::shape_size(output_shape) / output_shape[-1];
-            // Prepare CL memory mapping for P2P copying next
-            {
-                auto dst_idx = (w_rank + 1) % w_size;
-                cl_mem dst_cl_buf = nullptr;
-                cldnn::memory::ptr dst_mem = sub_mem_mgr->_memorys_table[id][dst_idx].recv_bufs[1];
-                size_t data_size = dst_mem->size();
-                auto dst_cl_buf_remote = std::dynamic_pointer_cast<const ocl::gpu_buffer>(dst_mem)->get_buffer().get();
-                dst_cl_buf = static_cast<cl_mem>(sub_mem_mgr->_memorys_table[id][w_rank].remote_mems[0]);
-                if (need_update_remote_mems || dst_cl_buf == nullptr) {
-                    if (dst_cl_buf) {
-                        release_remote_mems(dst_cl_buf);
+            if (is_all_reduce && all_reduce_solution == 2) {
+                while (true) {
+                    size_t wait_all_ouput_ready = 0;
+                    for (int idx = 0; idx < static_cast<int>(w_size); idx++) {
+                        if (sub_mem_mgr->_memorys_table[id][idx].recv_flag[0] == true)
+                            wait_all_ouput_ready++;
                     }
-                    dst_cl_buf = gpu_p2p_instance.map_remote_mem(local_context, dst_cl_buf_remote, data_size);
-                    sub_mem_mgr->_memorys_table[id][w_rank].remote_mems[0] = dst_cl_buf;
+                    if (wait_all_ouput_ready == w_size) {
+                        break;
+                    }
                 }
-            }
+                auto split_parts = [](int len, int n) {
+                    int average = len / n;
+                    std::vector<int> parts(n, average);
+                    parts.back() = len - average * (n - 1);
+                    return parts;
+                };
+
+                auto output_layout = instance.get_output_layout(0);
+                ov::element::Type output_element_type = output_layout.data_type;
+                auto output_element_size = output_element_type.size();
+                auto output_shape = output_layout.get_shape();
+                auto sub_out_dim_vec = split_parts(output_shape[-1], w_size);
+                if (0) {
+                    for (size_t iter = 0; iter < w_size; iter++) {
+                        std::cout << "sub_out_dim_vec[" << iter << "] " << sub_out_dim_vec[iter] << std::endl;
+                    }
+                }
+                auto output_height = ov::shape_size(output_shape) / output_shape[-1];
+                // Prepare CL memory mapping for P2P copying next
+                {
+                    auto dst_idx = (w_rank + 1) % w_size;
+                    cl_mem dst_cl_buf = nullptr;
+                    cldnn::memory::ptr dst_mem = sub_mem_mgr->_memorys_table[id][dst_idx].recv_bufs[1];
+                    size_t data_size = dst_mem->size();
+                    auto dst_cl_buf_remote = std::dynamic_pointer_cast<const ocl::gpu_buffer>(dst_mem)->get_buffer().get();
+                    dst_cl_buf = static_cast<cl_mem>(sub_mem_mgr->_memorys_table[id][w_rank].remote_mems[0]);
+                    if (need_update_remote_mems || dst_cl_buf == nullptr) {
+                        if (dst_cl_buf) {
+                            release_remote_mems(dst_cl_buf);
+                        }
+                        dst_cl_buf = gpu_p2p_instance.map_remote_mem(local_context, dst_cl_buf_remote, data_size);
+                        sub_mem_mgr->_memorys_table[id][w_rank].remote_mems[0] = dst_cl_buf;
+                    }
+                }
             // Start loop for sub buff copy & add
             for (int32_t i = 0; i < static_cast<int>(w_size) - 1; i++) {
                 auto src_mem = std::dynamic_pointer_cast<const ocl::gpu_buffer>(
@@ -1252,125 +1260,124 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
                 }
             }
         } else {
-        std::vector<int> wait_list(w_size, 1);
-        auto start_2 = perf_dump_start();
-        wait_list[w_rank] = 0;  // no need to wait for itself
-        size_t data_size = 0;
-        event::ptr sync_event = nullptr;
-        auto src_p2p_buf =
-            std::dynamic_pointer_cast<const ocl::gpu_buffer>(sub_mem_mgr->_memorys_table[id][w_rank].recv_bufs[w_rank]);
-        auto src_cl_buf = src_p2p_buf->get_buffer().get();
-        if (all_reduce_solution == 1) {
-            while (true) {
-                if (w_rank == 0)
-                    break;
-                if (w_rank != 0 && sub_mem_mgr->_memorys_table[id][0].flag) {
-                    cldnn::memory::ptr dst_mem = sub_mem_mgr->_memorys_table[id][0].recv_bufs[w_rank];
-                    auto dst_cl_buf_remote =
-                        std::dynamic_pointer_cast<const ocl::gpu_buffer>(dst_mem)->get_buffer().get();
-                    data_size = dst_mem->size();
-                    auto dst_cl_buf = gpu_p2p_instance.map_remote_mem(local_context, dst_cl_buf_remote, data_size);
-                    auto p2p_data_size = p2p_src_layout.bytes_count();
-
-                    gpu_lock.acquire();
-                    gpu_p2p_instance.remote_copy(stream, src_cl_buf, dst_cl_buf, p2p_data_size);
-                    gpu_lock.signal();
-
-                    sub_mem_mgr->_memorys_table[id][0].recv_flag[w_rank] = true;
-                    {
-                        std::lock_guard<std::mutex> lock(sub_mem_mgr->_flagMutex);
-                        sub_mem_mgr->_memorys_table[id][w_rank].events[0] = stream.create_user_event(true);
-                    }
-                    break;
-                }
-            }
-        } else {
-        while (true) {
-            int wait_size = 0;
-            for (int idx = 0; idx < static_cast<int>(w_size); idx++) {
-                if (idx != w_rank && wait_list[idx] > 0 && sub_mem_mgr->_memorys_table[id][idx].flag) {
-                    cl_mem dst_cl_buf = nullptr;
-                    if (is_all_reduce) {
-                        cldnn::memory::ptr dst_mem = sub_mem_mgr->_memorys_table[id][idx].recv_bufs[w_rank];
-                        data_size = dst_mem->size();
+            std::vector<int> wait_list(w_size, 1);
+            auto start_2 = perf_dump_start();
+            wait_list[w_rank] = 0;  // no need to wait for itself
+            size_t data_size = 0;
+            event::ptr sync_event = nullptr;
+            auto src_p2p_buf =
+                std::dynamic_pointer_cast<const ocl::gpu_buffer>(sub_mem_mgr->_memorys_table[id][w_rank].recv_bufs[w_rank]);
+            auto src_cl_buf = src_p2p_buf->get_buffer().get();
+            if (all_reduce_solution == 1) {
+                while (true) {
+                    if (w_rank == 0)
+                        break;
+                    if (w_rank != 0 && sub_mem_mgr->_memorys_table[id][0].flag) {
+                        cldnn::memory::ptr dst_mem = sub_mem_mgr->_memorys_table[id][0].recv_bufs[w_rank];
                         auto dst_cl_buf_remote =
                             std::dynamic_pointer_cast<const ocl::gpu_buffer>(dst_mem)->get_buffer().get();
-                        dst_cl_buf = static_cast<cl_mem>(sub_mem_mgr->_memorys_table[id][w_rank].remote_mems[idx]);
-                        if (need_update_remote_mems || dst_cl_buf == nullptr) {
-                            if (dst_cl_buf) {
-                                release_remote_mems(dst_cl_buf);
-                            }
-                            dst_cl_buf = gpu_p2p_instance.map_remote_mem(local_context, dst_cl_buf_remote, data_size);
-                            sub_mem_mgr->_memorys_table[id][w_rank].remote_mems[idx] = dst_cl_buf;
-                        }
-                    } else {
-                        cldnn::memory::ptr dst_mem = sub_mem_mgr->_memorys_table[id][idx].output;
                         data_size = dst_mem->size();
-                        auto dst_cl_buf_remote =
-                            std::dynamic_pointer_cast<const ocl::gpu_buffer>(dst_mem)->get_buffer().get();
-                        dst_cl_buf = static_cast<cl_mem>(all_gather_remote_dst[idx]);
-                        if (need_update_remote_mems || dst_cl_buf == nullptr) {
-                            if (dst_cl_buf) {
-                                release_remote_mems(dst_cl_buf);
-                            }
-                            dst_cl_buf = gpu_p2p_instance.map_remote_mem(local_context, dst_cl_buf_remote, data_size);
-                            all_gather_remote_dst[idx] = dst_cl_buf;
-                        }
-                    }
-                    auto p2p_data_size = p2p_src_layout.bytes_count();
-                    {
+                        auto dst_cl_buf = gpu_p2p_instance.map_remote_mem(local_context, dst_cl_buf_remote, data_size);
+                        auto p2p_data_size = p2p_src_layout.bytes_count();
+
                         gpu_lock.acquire();
-                        if (is_all_reduce) {
-                            gpu_p2p_instance.remote_copy(stream, src_cl_buf, dst_cl_buf, p2p_data_size);
-                        } else {
-                            gpu_p2p_instance.remote_copy_rect(stream,
-                                                              src_cl_buf,
-                                                              instance.get_output_layout(1),
-                                                              dst_cl_buf,
-                                                              instance.get_output_layout(0),
-                                                              w_rank,
-                                                              false);
-                        }
+                        gpu_p2p_instance.remote_copy(stream, src_cl_buf, dst_cl_buf, p2p_data_size);
                         gpu_lock.signal();
+
+                        sub_mem_mgr->_memorys_table[id][0].recv_flag[w_rank] = true;
+                        {
+                            std::lock_guard<std::mutex> lock(sub_mem_mgr->_flagMutex);
+                            sub_mem_mgr->_memorys_table[id][w_rank].events[0] = stream.create_user_event(true);
+                        }
+                        break;
                     }
-                    // P2P has been done.
-                    {
-                        std::lock_guard<std::mutex> lock(sub_mem_mgr->_flagMutex);
-                        sub_mem_mgr->_memorys_table[id][idx].events[w_rank] = stream.create_user_event(true);
-                    }
-                    // gpu_p2p_instance.destory_remote_mem(dst_cl_buf);
-                    wait_list[idx] = 0;
                 }
-                wait_size += wait_list[idx];
+            } else {
+                while (true) {
+                    int wait_size = 0;
+                    for (int idx = 0; idx < static_cast<int>(w_size); idx++) {
+                        if (idx != w_rank && wait_list[idx] > 0 && sub_mem_mgr->_memorys_table[id][idx].flag) {
+                            cl_mem dst_cl_buf = nullptr;
+                            if (is_all_reduce) {
+                                cldnn::memory::ptr dst_mem = sub_mem_mgr->_memorys_table[id][idx].recv_bufs[w_rank];
+                                data_size = dst_mem->size();
+                                auto dst_cl_buf_remote =
+                                    std::dynamic_pointer_cast<const ocl::gpu_buffer>(dst_mem)->get_buffer().get();
+                                dst_cl_buf = static_cast<cl_mem>(sub_mem_mgr->_memorys_table[id][w_rank].remote_mems[idx]);
+                                if (need_update_remote_mems || dst_cl_buf == nullptr) {
+                                    if (dst_cl_buf) {
+                                        release_remote_mems(dst_cl_buf);
+                                    }
+                                    dst_cl_buf = gpu_p2p_instance.map_remote_mem(local_context, dst_cl_buf_remote, data_size);
+                                    sub_mem_mgr->_memorys_table[id][w_rank].remote_mems[idx] = dst_cl_buf;
+                                }
+                            } else {
+                                cldnn::memory::ptr dst_mem = sub_mem_mgr->_memorys_table[id][idx].output;
+                                data_size = dst_mem->size();
+                                auto dst_cl_buf_remote =
+                                    std::dynamic_pointer_cast<const ocl::gpu_buffer>(dst_mem)->get_buffer().get();
+                                dst_cl_buf = static_cast<cl_mem>(all_gather_remote_dst[idx]);
+                                if (need_update_remote_mems || dst_cl_buf == nullptr) {
+                                    if (dst_cl_buf) {
+                                        release_remote_mems(dst_cl_buf);
+                                    }
+                                    dst_cl_buf = gpu_p2p_instance.map_remote_mem(local_context, dst_cl_buf_remote, data_size);
+                                    all_gather_remote_dst[idx] = dst_cl_buf;
+                                }
+                            }
+                            auto p2p_data_size = p2p_src_layout.bytes_count();
+                            {
+                                gpu_lock.acquire();
+                                if (is_all_reduce) {
+                                    gpu_p2p_instance.remote_copy(stream, src_cl_buf, dst_cl_buf, p2p_data_size);
+                                } else {
+                                    gpu_p2p_instance.remote_copy_rect(stream,
+                                                                    src_cl_buf,
+                                                                    instance.get_output_layout(1),
+                                                                    dst_cl_buf,
+                                                                    instance.get_output_layout(0),
+                                                                    w_rank,
+                                                                    false);
+                                }
+                                gpu_lock.signal();
+                            }
+                            // P2P has been done.
+                            {
+                                std::lock_guard<std::mutex> lock(sub_mem_mgr->_flagMutex);
+                                sub_mem_mgr->_memorys_table[id][idx].events[w_rank] = stream.create_user_event(true);
+                            }
+                            // gpu_p2p_instance.destory_remote_mem(dst_cl_buf);
+                            wait_list[idx] = 0;
+                        }
+                        wait_size += wait_list[idx];
+                    }
+                    if (wait_size == 0) {
+                        break;
+                    }
+                    auto end_2 = perf_dump_start();
+                    std::chrono::duration<double, std::milli> duration = end_2 - start_2;
+                    if (duration.count() > 10000) {
+                        start_2 = perf_dump_start();
+                        std::cout << "rank[" << w_rank << "]Error: sync_tensor p2p write timeout..." << std::endl;
+                    }
+                }
             }
-            if (wait_size == 0) {
-                break;
-            }
-            auto end_2 = perf_dump_start();
-            std::chrono::duration<double, std::milli> duration = end_2 - start_2;
-            if (duration.count() > 10000) {
-                start_2 = perf_dump_start();
-                std::cout << "rank[" << w_rank << "]Error: sync_tensor p2p write timeout..." << std::endl;
-            }
-        }
-    }
 
-        auto str_need_add = instance.get_impl_params()->need_add ? std::string("[need_add]") : std::string("");
-        perf_dump_done(start_2,
-                       std::string("rank[") + std::to_string(w_rank) + std::string("] sync_tensor p2p write ") +
-                           std::to_string(data_size) + " bytes" + str_need_add,
-                       true);
+            auto str_need_add = instance.get_impl_params()->need_add ? std::string("[need_add]") : std::string("");
+            perf_dump_done(start_2,
+                        std::string("rank[") + std::to_string(w_rank) + std::string("] sync_tensor p2p write ") +
+                            std::to_string(data_size) + " bytes" + str_need_add,
+                        true);
 
-        // P2P adopts sync write to avoid the problem of event cannot work across contexts
-        if (all_reduce_solution == 1) {
-            if (w_rank == 0)
+            // P2P adopts sync write to avoid the problem of event cannot work across contexts
+            if (all_reduce_solution == 1) {
+                if (w_rank == 0)
+                    wait_p2p_done(stream, gpu_p2p_instance, sub_mem_mgr, id, w_size, w_rank, all_reduce_solution, false);
+            } else {
                 wait_p2p_done(stream, gpu_p2p_instance, sub_mem_mgr, id, w_size, w_rank, all_reduce_solution, false);
-        } else {
-            wait_p2p_done(stream, gpu_p2p_instance, sub_mem_mgr, id, w_size, w_rank, all_reduce_solution, false);
+            }
         }
-
-        // std::vector<cldnn::event::ptr> sync_events;
-        if (is_all_reduce) {
+         if (is_all_reduce) {
             if (all_reduce_solution == 1) {
                 if (w_rank == 0) {
                     auto dst_mem_add = std::dynamic_pointer_cast<const ocl::gpu_buffer>(instance.output_memory_ptr(0));
@@ -1381,7 +1388,7 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
                             auto src_mem_add = sub_mem_mgr->_memorys_table[id][w_rank].recv_bufs[idx];
                             auto src_cl_buf_add =
                                 std::dynamic_pointer_cast<const ocl::gpu_buffer>(src_mem_add)->get_buffer().get();
-                            sync_event = adder_instance.tensor_add(
+                            auto sync_event = adder_instance.tensor_add(
                                 stream,
                                 src_cl_buf_add,
                                 dst_cl_buf_add,
@@ -1389,9 +1396,6 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
                                 adder_instance.element_type_to_kernel_data_type(dst_mem_add->get_layout().data_type));
                             sync_events.emplace_back(sync_event);
                         }
-                    }
-                    for (auto& evt : sync_events) {
-                        evt->wait();
                     }
                     // broadcast the all-reduce result on rank=0, to the others
                     auto src_p2p_buf_broadcast =
@@ -1431,7 +1435,7 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
                 if (idx != static_cast<size_t>(w_rank)) {
                     auto src_mem = sub_mem_mgr->_memorys_table[id][w_rank].recv_bufs[idx];
                     auto src_cl_buf = std::dynamic_pointer_cast<const ocl::gpu_buffer>(src_mem)->get_buffer().get();
-                    sync_event = adder_instance.tensor_add(
+                    auto sync_event = adder_instance.tensor_add(
                         stream,
                         src_cl_buf,
                         dst_cl_buf,
@@ -1466,14 +1470,7 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
                                                                 false);
             sync_events.emplace_back(sync_event);
         }
-        }
-        if (pass_through_events) {
-            if (events.size() > 1) {
-                return stream.group_events(events);
-            } else if (events.size() == 1) {
-                return events[0];
-            }
-        }
+
         perf_dump_done(start, std::string("rank[") + std::to_string(w_rank) + std::string("] sync_tensor total"), true);
 
         const auto end_xj = std::chrono::high_resolution_clock::now();
@@ -1490,7 +1487,12 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
             sub_mem_mgr->_memorys_table[id][w_rank].layout = p2p_src_layout;
             sub_mem_mgr->_use_count[id]++;
         }
-        return sync_events.size() > 0 ? stream.group_events(sync_events) : stream.create_user_event(true);
+        sync_tensor_grouped_event = sync_events.size() > 0 ? stream.group_events(sync_events) : stream.create_user_event(true);
+        instance.sync_cv.notify_all();
+    };
+
+        task_executor->run({blocked_p2p_operation});
+        return sync_tensor_grouped_event;
     }
 
     void init_kernels(const kernels_cache&, const kernel_impl_params&) override {}
