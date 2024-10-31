@@ -873,10 +873,10 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
 
     event::ptr execute_impl(const std::vector<event::ptr>& events, sync_tensor_inst& instance) override {
         OV_ITT_SCOPED_TASK(ov::intel_gpu::itt::domains::intel_gpu_plugin, "sync_tensor::execute_impl");
-        auto& stream = instance.get_network().get_stream();
 
         auto w_rank = instance.get_network().get_program()->get_config().subStreamExecConfig.get_rank()[0];
         auto w_size = instance.get_network().get_program()->get_config().get_context_for_tp().size();
+        auto task_executor = instance.get_network().get_program()->get_task_executor();
         auto is_all_reduce = instance.get_impl_params()->need_add == true;
         if (!is_all_reduce && all_gather_remote_dst.size() == 0) {
             all_gather_remote_dst.assign(w_size, nullptr);
@@ -888,7 +888,7 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
             if (all_reduce_add_solution)
                 all_reduce_solution = std::atoi(all_reduce_add_solution);
         }
-        auto task_executor = instance.get_network().get_program()->get_task_executor();
+
         auto start = perf_dump_start();
         if (getenv("OV_TP_ENABLE_WAIT_FOR_PROFILE")) {
             for (auto e : events) {
@@ -904,11 +904,8 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
         auto id = 0;
         // auto id = sub_mem_mgr->get_memory_id(w_rank);
         sub_mem_mgr->set_memory_used(id, w_rank);
-        std::vector<cldnn::event::ptr> sync_events;
-        auto p2p_src_layout = instance.get_output_layout(0);
         auto start_1 = perf_dump_start();
         while (true) {
-            std::unique_lock<std::mutex> sync_lock(instance.sync_mutex);
             std::lock_guard<std::mutex> lock(sub_mem_mgr->_flagMutex);
             if (sub_mem_mgr->_use_count[id] == w_size) {
                 sub_mem_mgr->_use_count[id] = 0;
@@ -937,11 +934,17 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
         perf_dump_done(start_1,
                     std::string("rank[") + std::to_string(w_rank) + std::string("] sync_tensor wait data ready"),
                     true);
-        gpu_p2p_helper& gpu_p2p_instance = get_p2p_instance();
-        auto& ocl_stream = downcast<ocl::ocl_stream>(stream);
-        event::ptr sync_tensor_grouped_event;
-        auto local_context = ocl_stream.get_engine().get_cl_context().get();
-            ov::threading::Task blocked_p2p_operation = [&]() {
+        if (instance.sync_event)
+            instance.sync_event = nullptr;
+        ov::threading::Task blocked_p2p_operation =
+            [w_size, w_rank, is_all_reduce, all_reduce_solution, id, this, start, sub_mem_mgr, &instance]() mutable {
+            std::vector<cldnn::event::ptr> sync_events;
+            gpu_p2p_helper& gpu_p2p_instance = get_p2p_instance();
+            auto& stream = instance.get_network().get_stream();
+            auto& ocl_stream = downcast<ocl::ocl_stream>(stream);
+            auto local_context = ocl_stream.get_engine().get_cl_context().get();
+            auto p2p_src_layout = instance.get_output_layout(0);
+            std::lock_guard<std::mutex> sync_lock(instance.sync_mutex);
             bool need_update_remote_mems = false;
             if (is_all_reduce) {
                 OPENVINO_ASSERT(1 == instance.get_output_memorys().size(), "All reduce only has one output!");
@@ -960,7 +963,6 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
                                                                 w_rank,
                                                                 all_reduce_solution);
             } else {
-                std::cout << "bell debug in impl: " << instance.id() << std::endl;
                 OPENVINO_ASSERT(2 == instance.get_output_memorys().size(),
                                 "All gather need additional buffer for concat result!");
                 sub_mem_mgr->_memorys_table[id][w_rank].recv_bufs[w_rank] = instance.get_output_memorys()[1];
@@ -1487,12 +1489,12 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
             sub_mem_mgr->_memorys_table[id][w_rank].layout = p2p_src_layout;
             sub_mem_mgr->_use_count[id]++;
         }
-        sync_tensor_grouped_event = sync_events.size() > 0 ? stream.group_events(sync_events) : stream.create_user_event(true);
+        instance.sync_event = sync_events.size() > 0 ? stream.group_events(sync_events) : stream.create_user_event(true);
         instance.sync_cv.notify_all();
     };
 
         task_executor->run({blocked_p2p_operation});
-        return sync_tensor_grouped_event;
+        return instance.sync_event; // to be checked further for out-of-order queue
     }
 
     void init_kernels(const kernels_cache&, const kernel_impl_params&) override {}

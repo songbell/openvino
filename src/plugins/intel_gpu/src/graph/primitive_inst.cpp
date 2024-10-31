@@ -1203,11 +1203,11 @@ void primitive_inst::do_runtime_extra_sync() {
     // one of input is sync tensor
     auto check_input = is_any_input_sync_tensor(_node);
     if (check_input.first) {
-        std::cout << "bell debug: found dependency sync tensor: " << check_input.second << std::endl;
+        GPU_DEBUG_TRACE_DETAIL << "[ do runtime extra sync in ]  " << id() << std::endl;
         auto inst = std::dynamic_pointer_cast<sync_tensor_inst>(_network.get_primitive(check_input.second));
         std::unique_lock<std::mutex> ul(inst->sync_mutex);
-        inst->sync_cv.wait(ul, [this]() {
-                return true;
+        inst->sync_cv.wait(ul, [&]() {
+                return inst->sync_event != nullptr;
             });
     }
 }
@@ -1742,8 +1742,9 @@ event::ptr primitive_inst::execute(const std::vector<event::ptr>& events) {
 
                 is_updated = true;
             }
+        } else {
+           do_runtime_extra_sync();
         }
-
         // Paged Attention may require dispatch data update and internal buffers reallocation
         // even if the input shapes haven't been changed
         if (_node->is_type<paged_attention>() && !is_updated && _impl->requires_update(*this, *_impl_params)) {
@@ -1796,7 +1797,7 @@ event::ptr primitive_inst::execute(const std::vector<event::ptr>& events) {
             }
         }
     }
-    do_runtime_extra_sync();
+
     GPU_DEBUG_TRACE << id() << ": execute " << _impl->get_kernel_name() << " (is_dynamic=" << _impl->is_dynamic()
                     << ", "
                     << "can_be_optimized=" << can_be_optimized() << ")" << std::endl;
@@ -1829,7 +1830,7 @@ event::ptr primitive_inst::execute(const std::vector<event::ptr>& events) {
         auto grouped_ev = get_network().get_stream().group_events(dependencies);
         dependencies = {grouped_ev};
     }
-
+    do_runtime_extra_sync();
     {
         GPU_DEBUG_PROFILED_STAGE(instrumentation::pipeline_stage::inference);
         auto ev = _impl->execute(dependencies, *this);
@@ -2244,7 +2245,7 @@ memory::ptr primitive_inst::allocate_output(engine& _engine,
     // Do not use memory pool for nodes from shape_of subgraphs, because such nodes mostly use CPU impls and may be executed in parallel with predecessors
     // GPU kernels and cause accuracy problems. This significantly improves performance (because provides an ability not to synchronize shape_of subgraphs
     // execution with other nodes) at the cost of tiny increase in memory consumption.
-    if (_node.is_in_shape_of_subgraph())
+    if (_node.is_in_shape_of_subgraph() || _node.is_extra_sync_needed())
         reusable_across_network = false;
 
     // For outputs, cpu prim we want to have lockable alloc type

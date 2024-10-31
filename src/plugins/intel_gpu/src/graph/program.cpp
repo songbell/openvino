@@ -651,6 +651,9 @@ void program::post_optimize_graph(bool is_internal) {
 
     // update inner program input/output primitive mappings
     apply_opt_pass<update_inner_program_io_map>();
+
+    // mark nodes after sync tensor, for extra sync up between threads
+    apply_opt_pass<mark_extra_sync_nodes>();
     // Recalculate processing order after all graph transformation to keep optimal primitives ordering
     // for OOO queue
     if (_config.get_property(ov::intel_gpu::queue_type) == QueueTypes::out_of_order)

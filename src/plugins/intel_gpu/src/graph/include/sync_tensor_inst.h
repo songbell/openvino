@@ -62,6 +62,7 @@ public:
     void update_output_memory() override;
     std::mutex sync_mutex;
     std::condition_variable sync_cv;
+    event::ptr sync_event;
 
 protected:
     void on_execute() override;
