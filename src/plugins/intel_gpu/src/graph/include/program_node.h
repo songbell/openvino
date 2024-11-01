@@ -294,8 +294,6 @@ public:
 
     void set_in_shape_of_subgraph(bool val = true) { in_shape_of_subgraph = val; }
     bool is_in_shape_of_subgraph() const { return in_shape_of_subgraph; }
-    void set_extra_sync_needed(bool val = true) { needs_extra_sync = val; }
-    bool is_extra_sync_needed() const { return needs_extra_sync; }
     // check/set if the node can be optimized out (removed from the network)
     bool can_be_optimized() const { return optimized; }
     void can_be_optimized(bool opt) { optimized = opt; }
@@ -494,7 +492,6 @@ protected:
     bool constant = false;
     bool data_flow = false;
     bool in_shape_of_subgraph = false;
-    bool needs_extra_sync = false;
     bool runtime_skippable = false;
 
     std::set<const program_node*> dependant_shape_of_nodes;

@@ -890,12 +890,6 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
         }
 
         auto start = perf_dump_start();
-        if (getenv("OV_TP_ENABLE_WAIT_FOR_PROFILE")) {
-            for (auto e : events) {
-                e->wait();
-            }
-            instance.sync_wait_times = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - start).count();
-        }
 
         perf_dump_done(start,
                        std::string("rank[") + std::to_string(w_rank) + std::string("] sync_tensor wait events"),
@@ -929,6 +923,12 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
                 start_1 = perf_dump_start();
                 std::cout << "rank[" << w_rank << "]Error: sync_tensor wait data ready timeout..." << std::endl;
             }
+        }
+        if (getenv("OV_TP_ENABLE_WAIT_FOR_PROFILE")) {
+            for (auto e : events) {
+                e->wait();
+            }
+            instance.sync_wait_times = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - start).count();
         }
 
         perf_dump_done(start_1,
@@ -1129,7 +1129,7 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
                     output_shape[-1],
                     sub_out_dim_vec[rec_sub_part],
                     output_height * off_set_add);
-                sync_add_event->wait();
+                //sync_add_event->wait();
                 auto end_add = perf_dump_start();
                 std::chrono::duration<double, std::milli> duration = end_add - start_add;
                 if (0) {

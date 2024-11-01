@@ -1742,9 +1742,8 @@ event::ptr primitive_inst::execute(const std::vector<event::ptr>& events) {
 
                 is_updated = true;
             }
-        } else {
-           do_runtime_extra_sync();
         }
+
         // Paged Attention may require dispatch data update and internal buffers reallocation
         // even if the input shapes haven't been changed
         if (_node->is_type<paged_attention>() && !is_updated && _impl->requires_update(*this, *_impl_params)) {
@@ -2245,7 +2244,7 @@ memory::ptr primitive_inst::allocate_output(engine& _engine,
     // Do not use memory pool for nodes from shape_of subgraphs, because such nodes mostly use CPU impls and may be executed in parallel with predecessors
     // GPU kernels and cause accuracy problems. This significantly improves performance (because provides an ability not to synchronize shape_of subgraphs
     // execution with other nodes) at the cost of tiny increase in memory consumption.
-    if (_node.is_in_shape_of_subgraph() || _node.is_extra_sync_needed())
+    if (_node.is_in_shape_of_subgraph())
         reusable_across_network = false;
 
     // For outputs, cpu prim we want to have lockable alloc type
