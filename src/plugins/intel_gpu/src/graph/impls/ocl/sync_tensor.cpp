@@ -1378,7 +1378,6 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
             } else {
                 wait_p2p_done(stream, gpu_p2p_instance, sub_mem_mgr, id, w_size, w_rank, all_reduce_solution, false);
             }
-        }
          if (is_all_reduce) {
             if (all_reduce_solution == 1) {
                 if (w_rank == 0) {
@@ -1472,7 +1471,7 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
                                                                 false);
             sync_events.emplace_back(sync_event);
         }
-
+        }
         perf_dump_done(start, std::string("rank[") + std::to_string(w_rank) + std::string("] sync_tensor total"), true);
 
         const auto end_xj = std::chrono::high_resolution_clock::now();
