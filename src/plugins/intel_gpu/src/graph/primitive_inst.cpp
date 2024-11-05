@@ -1198,6 +1198,7 @@ void primitive_inst::update_paddings() {
 void primitive_inst::do_runtime_extra_sync() {
     OV_ITT_SCOPED_TASK(ov::intel_gpu::itt::domains::intel_gpu_plugin, openvino::itt::handle("do_runtime_extra_sync: " + id()));
     GPU_DEBUG_GET_INSTANCE(debug_config);
+    auto start = std::chrono::high_resolution_clock::now();
     if (can_be_optimized())
         return;
     // one of input is sync tensor
@@ -1210,6 +1211,7 @@ void primitive_inst::do_runtime_extra_sync() {
                 return inst->sync_event != nullptr;
             });
     }
+    extra_sync_times = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - start).count();
 }
 
 void primitive_inst::do_runtime_skip_reorder() {
