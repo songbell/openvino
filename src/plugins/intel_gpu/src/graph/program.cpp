@@ -115,10 +115,9 @@ static ov::threading::IStreamsExecutor::Config make_task_executor_config(const E
         default: OPENVINO_ASSERT(false, "[GPU] Can't create task executor: invalid host task priority value: ", priority);
     }
     bool enable_cpu_pinning = config.get_property(ov::hint::enable_cpu_pinning);
-
     ov::threading::IStreamsExecutor::Config task_executor_config(tags,
                                                                  streams,
-                                                                 1,
+                                                                 0,
                                                                  core_type,
                                                                  enable_cpu_pinning);
 
@@ -652,8 +651,6 @@ void program::post_optimize_graph(bool is_internal) {
     // update inner program input/output primitive mappings
     apply_opt_pass<update_inner_program_io_map>();
 
-    // mark nodes after sync tensor, for extra sync up between threads
-    apply_opt_pass<mark_extra_sync_nodes>();
     // Recalculate processing order after all graph transformation to keep optimal primitives ordering
     // for OOO queue
     if (_config.get_property(ov::intel_gpu::queue_type) == QueueTypes::out_of_order)

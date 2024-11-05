@@ -1198,6 +1198,7 @@ void primitive_inst::update_paddings() {
 void primitive_inst::do_runtime_extra_sync() {
     OV_ITT_SCOPED_TASK(ov::intel_gpu::itt::domains::intel_gpu_plugin, openvino::itt::handle("do_runtime_extra_sync: " + id()));
     GPU_DEBUG_GET_INSTANCE(debug_config);
+    auto start = std::chrono::high_resolution_clock::now();
     if (can_be_optimized())
         return;
     // one of input is sync tensor
@@ -1210,6 +1211,7 @@ void primitive_inst::do_runtime_extra_sync() {
                 return inst->sync_event != nullptr;
             });
     }
+    extra_sync_times = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - start).count();
 }
 
 void primitive_inst::do_runtime_skip_reorder() {
@@ -1742,9 +1744,8 @@ event::ptr primitive_inst::execute(const std::vector<event::ptr>& events) {
 
                 is_updated = true;
             }
-        } else {
-           do_runtime_extra_sync();
         }
+
         // Paged Attention may require dispatch data update and internal buffers reallocation
         // even if the input shapes haven't been changed
         if (_node->is_type<paged_attention>() && !is_updated && _impl->requires_update(*this, *_impl_params)) {
@@ -2245,7 +2246,7 @@ memory::ptr primitive_inst::allocate_output(engine& _engine,
     // Do not use memory pool for nodes from shape_of subgraphs, because such nodes mostly use CPU impls and may be executed in parallel with predecessors
     // GPU kernels and cause accuracy problems. This significantly improves performance (because provides an ability not to synchronize shape_of subgraphs
     // execution with other nodes) at the cost of tiny increase in memory consumption.
-    if (_node.is_in_shape_of_subgraph() || _node.is_extra_sync_needed())
+    if (_node.is_in_shape_of_subgraph())
         reusable_across_network = false;
 
     // For outputs, cpu prim we want to have lockable alloc type

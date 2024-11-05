@@ -88,14 +88,6 @@ private:
     void run(program& p) override;
 };
 
-class mark_extra_sync_nodes : public base_pass {
-public:
-    mark_extra_sync_nodes() : base_pass("handle_extra_sync") {}
-
-private:
-    void run(program& p) override;
-};
-
 class mark_shape_of_subgraphs : public base_pass {
     // This optimization pass aggregates nodes into shape_of subgraphs for further optimizations.
     // There are few key requirements to decide if node belongs to shape_of subgraph or not:
