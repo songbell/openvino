@@ -36,7 +36,7 @@ CommonDispatchData QuantizeKernelScaleShift::SetDefault(const quantize_params& p
     CommonDispatchData dispatchData;
 
     auto output = params.outputs[0];
-
+    size_t vec_size = GetVecSize(params);
     if (output.GetLayout() == DataLayout::b_fs_yx_fsv16 || output.GetLayout() == DataLayout::b_fs_yx_fsv32 ||
         output.GetLayout() == DataLayout::b_fs_zyx_fsv32) {
         dispatchData.gws[0] = output.Z().v * output.Y().v * output.X().v;
@@ -59,6 +59,8 @@ CommonDispatchData QuantizeKernelScaleShift::SetDefault(const quantize_params& p
         dispatchData.lws[2] = params.engineInfo.maxWorkGroupSize / feature_size;
     } else {
         dispatchData.gws = GetTensorFriendlyWorkGroups(output);
+        // TBD, handle the case when not divisible
+        dispatchData.gws[0] = dispatchData.gws[0] > vec_size ? dispatchData.gws[0] / vec_size : 1;
         auto out_layout = params.outputs[0].GetLayout();
         dispatchData.lws = GetOptimalLocalWorkGroupSizes(dispatchData.gws, params.engineInfo, out_layout, out_layout);
     }
@@ -110,8 +112,31 @@ JitConstants QuantizeKernelScaleShift::GetJitConstants(const quantize_params& pa
     jit.AddConstant(MakeJitConstant("OUT_SHIFT_VAL", params.out_shift));
     jit.AddConstant(MakeJitConstant("CAN_USE_OUTPUT_RANGE", can_use_output_range));
     jit.AddConstant(MakeJitConstant("HAS_OUTPUT_RANGE_ROUND", has_output_range_round));
+    jit.AddConstant(MakeJitConstant("VEC_SIZE", GetVecSize(params)));
 
     return jit;
+}
+
+size_t QuantizeKernelScaleShift::GetVecSize(const quantize_params& params) const {
+    const auto& input = params.inputs[0];
+    size_t vec_size = 1;
+    switch (input.GetDType()) {
+        case Datatype::F16:
+            vec_size = 16;
+            break;
+        case Datatype::F32:
+            vec_size = 8;
+            break;
+        case Datatype::UINT8:
+            vec_size = 8;
+            break;
+        default:
+            vec_size = 1;
+        }
+    // TBD: handle case when gws not divisble by vec_size
+    //if (!params.per_tensor_input_range || !params.per_tensor_output_range || !params.per_tensor_input_scale || !params.per_tensor_output_scale)
+        //vec_size = 1;
+    return vec_size;
 }
 
 bool QuantizeKernelScaleShift::Validate(const Params& p) const {

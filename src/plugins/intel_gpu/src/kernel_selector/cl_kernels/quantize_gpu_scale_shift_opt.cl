@@ -5,8 +5,16 @@
 #include "include/batch_headers/fetch_data.cl"
 
 #define TO_OUTPUT_TYPE              CAT(convert_, OUTPUT_TYPE)
+#define TO_OUTPUT_VECTOR_TYPE       CAT(TO_OUTPUT_TYPE, VEC_SIZE)
 #define TO_OUTPUT_TYPE_SAT_RTE      CAT(TO_OUTPUT_TYPE, _sat_rte)
+#define TO_OUTPUT_VECTOR_TYPE_SAT_RTE CAT(TO_OUTPUT_VECTOR_TYPE, _sat_rte)
 
+#define INPUT0_VEC_TYPE  MAKE_VECTOR_TYPE(INPUT0_TYPE, VEC_SIZE)
+#define INPUT1_VEC_TYPE  MAKE_VECTOR_TYPE(INPUT1_TYPE, VEC_SIZE)
+#define OUTPUT_VEC_TYPE MAKE_VECTOR_TYPE(OUTPUT_TYPE, VEC_SIZE)
+
+#define CONVERT_WITH_VECTOR_SIZE CAT(convert_float, VEC_SIZE)
+#define TO_INPUT1_VEC_TYPE(v) CONVERT_WITH_VECTOR_SIZE(v)
 #ifdef SUB_GROUP_SIZE
 REQD_SUB_GROUP_SIZE(SUB_GROUP_SIZE)
 #endif
@@ -29,7 +37,7 @@ KERNEL(quantize_gpu_scale_shift_opt)(OPTIONAL_SHAPE_INFO_ARG
     const int of = get_global_id(GWS_FEATURE);
 
 #if OUTPUT_DIMS <= 4
-    const int yx = get_global_id(GWS_YX);
+    const int yx = get_global_id(GWS_YX)  * VEC_SIZE;
 
     const int x = yx % OUTPUT_SIZE_X;
     const int y = yx / OUTPUT_SIZE_X;
@@ -164,6 +172,9 @@ KERNEL(quantize_gpu_scale_shift_opt)(OPTIONAL_SHAPE_INFO_ARG
 #endif // CAN_USE_OUTPUT_RANGE
 #endif // HAS_CLAMP
 
+// compute using vectors
+INPUT0_VEC_TYPE inv0 = *(INPUT0_VEC_TYPE*)(input + input_offset);
+\
 // ************************************************************* //
 // Calculations for optimized branch with the output range usage //
 // ************************************************************* //
@@ -171,9 +182,9 @@ KERNEL(quantize_gpu_scale_shift_opt)(OPTIONAL_SHAPE_INFO_ARG
 #if CAN_USE_OUTPUT_RANGE
 
 #if HAS_PRE_SHIFT
-    INPUT1_TYPE val = TO_INPUT1_TYPE(input[input_offset]) * input_scale_val + input_shift_val;
+    INPUT1_VEC_TYPE val = TO_INPUT1_VEC_TYPE(inv0) * input_scale_val + input_shift_val;
 #else
-    INPUT1_TYPE val = TO_INPUT1_TYPE(input[input_offset]) * input_scale_val;
+    INPUT1_VEC_TYPE val = TO_INPUT1_VEC_TYPE(inv0) * input_scale_val;
 #endif
 
 #if HAS_OUTPUT_RANGE_ROUND
@@ -205,9 +216,9 @@ KERNEL(quantize_gpu_scale_shift_opt)(OPTIONAL_SHAPE_INFO_ARG
 #else // CAN_USE_OUTPUT_RANGE
 
 #if HAS_CLAMP
-    INPUT1_TYPE val = clamp(TO_INPUT1_TYPE(input[input_offset]), input_low_val, input_high_val);
+    INPUT1_VEC_TYPE val = clamp(TO_INPUT1_TYPE(inv0), input_low_val, input_high_val);
 #else
-    INPUT1_TYPE val = TO_INPUT1_TYPE(input[input_offset]);
+    INPUT1_VEC_TYPE val = TO_INPUT1_TYPE(inv0);
 #endif
 
 #if HAS_PRE_SHIFT
@@ -229,14 +240,18 @@ KERNEL(quantize_gpu_scale_shift_opt)(OPTIONAL_SHAPE_INFO_ARG
 // *********************************** //
 // Common section with results writing //
 // *********************************** //
-
+// handle the outputs
 #if FEATURE_BLOCKED_FORMAT
     if (of < OUTPUT_FEATURE_NUM)
 #endif
 #if OUTPUT_IS_FP
-        output[output_offset] = TO_OUTPUT_TYPE_SAT(val);
+    unroll_for(int j = 0; j < VEC_SIZE; j += 1) {
+        output[output_offset + j] = TO_OUTPUT_TYPE_SAT(val[j]);
+    }
 #else
-        output[output_offset] = TO_OUTPUT_TYPE_SAT_RTE(val);
+    unroll_for(int j = 0; j < VEC_SIZE; j += 1) {
+        output[output_offset + j] = TO_OUTPUT_TYPE_SAT_RTE(val[j]);
+    }
 #endif
 }
 

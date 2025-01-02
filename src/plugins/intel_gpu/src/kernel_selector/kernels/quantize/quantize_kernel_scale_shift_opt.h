@@ -20,5 +20,8 @@ public:
     KernelsPriority GetKernelsPriority(const Params& params) const override;
     bool Validate(const Params& p) const override;
     ParamsKey GetSupportedKey() const override;
+
+private:
+    size_t GetVecSize(const quantize_params& params) const;
 };
 }  // namespace kernel_selector
