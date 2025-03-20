@@ -12,7 +12,7 @@ namespace kernel_selector {
 struct kv_cache_rotate_params : base_params {
     kv_cache_rotate_params() : base_params(KernelType::PA_KV_CACHE_ROTATE) {}
 
-    Datatype original_cache_dt;
+    bool is_prefill = false;
     sdpa_configuration conf;
 };
 

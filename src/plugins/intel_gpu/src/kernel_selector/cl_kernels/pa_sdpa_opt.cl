@@ -7,7 +7,7 @@
 #include "include/batch_headers/sub_group_block_write.cl"
 #include "include/batch_headers/sub_group_shuffle.cl"
 
-#define SUBGROUPS_PER_WG ((HEAD_SIZE / SUBGROUP_SIZE) * SG_SCALE_FACTOR)
+#define SUBGROUPS_PER_WG (HEAD_SIZE / SUBGROUP_SIZE)
 #define PAGED_ATTENTION_BLOCKS_PER_PARTITION (SEQ_LEN_PARTITION_SIZE / PAGED_ATTENTION_BLOCK_SIZE)
 
 #if HEAD_SIZE > 128 || HEADS_PER_WI > 1
@@ -45,7 +45,7 @@
 #define GET_VECTOR_ELEMENT(vec, idx) _VEC_ELEMENT_ACCESSOR(QUERIES_PER_WI, vec, idx)
 
 REQD_SUB_GROUP_SIZE(SUBGROUP_SIZE)
-__attribute__((reqd_work_group_size(1, 1, HEAD_SIZE * SG_SCALE_FACTOR)))
+__attribute__((reqd_work_group_size(1, 1, HEAD_SIZE)))
 KERNEL(pa_sdpa_opt)(
     OPTIONAL_SHAPE_INFO_ARG
     const __global INPUT0_TYPE* query,
@@ -103,19 +103,10 @@ KERNEL(pa_sdpa_opt)(
         min(KV_HEADS_GROUP_SIZE - ((heads_group_idx % ITERATIONS_PER_KV_HEADS_GROUP) * HEADS_PER_WI), (uint)HEADS_PER_WI);
 #else
     const uint head_num_idx = get_global_id(1);
-#endif
+    const uint head_size_idx = get_global_id(2);
     const uint sglid = get_sub_group_local_id();
     const uint sgid = get_sub_group_id();
     const uint total_partitions_num = get_num_groups(2);
-    const uint lid = get_local_id(2);
-
-#if SG_SCALE_FACTOR == 2
-    const uint head_size_idx = lid % HEAD_SIZE;
-#elif SG_SCALE_FACTOR == 1
-    const uint head_size_idx = lid;
-#else
-    #error "pa_sdpa_opt.cl: Unsupported scale factor"
-#endif
 
     const uint batch_idx = seq_idx;
 
@@ -130,6 +121,7 @@ KERNEL(pa_sdpa_opt)(
 #endif
 
     const uint partition_idx = get_group_id(2);
+    const uint block_start_idx = partition_idx * SEQ_LEN_PARTITION_SIZE / PAGED_ATTENTION_BLOCK_SIZE;
 
     if (partition_idx * SEQ_LEN_PARTITION_SIZE >= seq_len) {
         return;
@@ -206,38 +198,22 @@ KERNEL(pa_sdpa_opt)(
 
         const uint start_block_idx = block_indices_begins[subsequence_idx] + partition_idx * PAGED_ATTENTION_BLOCKS_PER_PARTITION + sgid;
         for (uint block_num = 0; block_num < blocks_num; block_num++) {
-            const uint head_idx = head_num_idx / KV_HEADS_GROUP_SIZE;
-            const uint block_offset = block_indices[start_block_idx + block_num * SUBGROUPS_PER_WG] * ADJUSTED_HEAD_SIZE * KV_HEADS_NUM * SUBGROUP_SIZE + head_idx * ADJUSTED_HEAD_SIZE * SUBGROUP_SIZE;
+#ifdef BROADCAST_GROUP_SIZE
+            const uint head_idx = head_num_idx / BROADCAST_GROUP_SIZE;
+#else
+            const uint head_idx = head_num_idx;
+#endif
+            const uint block_offset = block_indices[start_block_idx + block_num * SUBGROUPS_PER_WG] * HEAD_SIZE * KV_HEADS_NUM * SUBGROUP_SIZE + head_idx * HEAD_SIZE * SUBGROUP_SIZE;
 
             SOFTMAX_ACCUMULATOR_VEC_TYPE qk_acc = SOFTMAX_ACCUMULATOR_VAL_ZERO;
 
             #define KEY_VEC_SIZE SUBGROUP_SIZE
-            #define KEY_BLOCK MAKE_VECTOR_TYPE(INPUT1_TYPE, KEY_VEC_SIZE)
-#if IS_KV_COMPRESSED
-            const uint key_comp_offset = block_offset + HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE;
-            INPUT0_TYPE* key_comp_ptr = key_cache + key_comp_offset;
-            INPUT0_TYPE comp_scale = key_comp_ptr[0 + sglid];
-            INPUT0_TYPE comp_zp = key_comp_ptr[PAGED_ATTENTION_BLOCK_SIZE + sglid];
-#endif
-
             unroll_for (uint qk_idx = 0; qk_idx < HEAD_SIZE / KEY_VEC_SIZE; qk_idx++) {
-                #define KEY_BLOCK_UNCOMPRESSED MAKE_VECTOR_TYPE(INPUT0_TYPE, KEY_VEC_SIZE)
-                #define TO_KEY_BLOCK_UNCOMPRESSED_TYPE(val) CAT(convert_, KEY_BLOCK_UNCOMPRESSED)(val)
-
-#if IS_KV_COMPRESSED
-                KEY_BLOCK_UNCOMPRESSED k_vals;
-                unroll_for (uint i = 0; i < KEY_VEC_SIZE; i++) {
-                    k_vals[i] = BLOCK_READN(INPUT1_TYPE, 1, key_cache, block_offset + qk_idx * SUBGROUP_SIZE * KEY_VEC_SIZE + i * SUBGROUP_SIZE);
-                    k_vals[i] = (k_vals[i] - comp_zp) * comp_scale;
-                }
-#else
-                KEY_BLOCK k_vals = 0;
+                MAKE_VECTOR_TYPE(INPUT1_TYPE, KEY_VEC_SIZE) k_vals = 0;
                 unroll_for (uint i = 0; i < KEY_VEC_SIZE; i++) {
                     k_vals[i] = BLOCK_READN(INPUT1_TYPE, 1, key_cache, block_offset + qk_idx * SUBGROUP_SIZE * KEY_VEC_SIZE + i * SUBGROUP_SIZE);
                 }
-#endif
 
-#if XE2_QK_MULTIPLICATION
 #if STORE_QUERY_TO_SLM
                 MAKE_VECTOR_TYPE(INPUT0_TYPE, QUERIES_PER_WI) q_val;
                 unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
@@ -434,15 +410,6 @@ KERNEL(pa_sdpa_opt)(
         MAKE_VECTOR_TYPE(OUTPUT_TYPE, QUERIES_PER_WI) acc = OUTPUT_VAL_ZERO;
 
         const uint partition_seq_len = min(seq_len - partition_idx * SEQ_LEN_PARTITION_SIZE, (uint)SEQ_LEN_PARTITION_SIZE);
-
-#if SG_SCALE_FACTOR > 1
-        const uint block_start_idx = (sgid / (SUBGROUPS_PER_WG / SG_SCALE_FACTOR)) * (SEQ_LEN_PARTITION_SIZE / SG_SCALE_FACTOR / SUBGROUP_SIZE);
-        const uint block_end_idx = min(block_start_idx + (SEQ_LEN_PARTITION_SIZE / SG_SCALE_FACTOR / SUBGROUP_SIZE), partition_seq_len / SUBGROUP_SIZE);
-#else
-        const uint block_start_idx = 0;
-        const uint block_end_idx = partition_seq_len / SUBGROUP_SIZE;
-#endif
-
         uint blocks_num_per_partition = min(total_blocks_num - partition_idx * PAGED_ATTENTION_BLOCKS_PER_PARTITION, (uint)PAGED_ATTENTION_BLOCKS_PER_PARTITION);
 
         uint leftovers = blocks_num_per_partition * PAGED_ATTENTION_BLOCK_SIZE - partition_seq_len;
@@ -453,40 +420,21 @@ KERNEL(pa_sdpa_opt)(
 
         const uint start_block_idx = block_indices_begins[subsequence_idx] + partition_idx * PAGED_ATTENTION_BLOCKS_PER_PARTITION;
 
-        for (uint block_num = block_start_idx; block_num < block_end_idx; block_num++) {
-            const uint head_idx = head_num_idx / KV_HEADS_GROUP_SIZE;
-            const uint block_offset = block_indices[start_block_idx + block_num] * KV_HEADS_NUM * ADJUSTED_HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE + head_idx * ADJUSTED_HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE;
-            const uint value_offset = block_offset + head_size_idx;
-
-#if IS_KV_COMPRESSED
-            const uint value_comp_offset = block_offset + HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE;
-            INPUT0_TYPE* value_comp_ptr = value_cache + value_comp_offset;
-            INPUT0_TYPE comp_scale = value_comp_ptr[0 + sglid];
-            INPUT0_TYPE comp_zp = value_comp_ptr[PAGED_ATTENTION_BLOCK_SIZE + sglid];
+        for (uint block_num = 0; block_num < blocks_num_per_partition; block_num++) {
+#ifdef BROADCAST_GROUP_SIZE
+            const uint head_idx = head_num_idx / BROADCAST_GROUP_SIZE;
+#else
+            const uint head_idx = head_num_idx;
 #endif
+            const uint block_offset = block_indices[start_block_idx + block_num] * KV_HEADS_NUM * HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE + head_idx * HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE + sgid * SUBGROUP_SIZE;
 
             #define VALUE_VEC_SIZE SUBGROUP_SIZE
-            #define VALUE_UNCOMPRESSED INPUT0_TYPE
-            #define VALUE_BLOCK MAKE_VECTOR_TYPE(INPUT2_TYPE, VALUE_VEC_SIZE)
-            #define VALUE_BLOCK_UNCOMPRESSED MAKE_VECTOR_TYPE(INPUT0_TYPE, VALUE_VEC_SIZE)
-            #define TO_VALUE_UNCOMPRESSED_TYPE(val) CAT(convert_, VALUE_UNCOMPRESSED)(val)
-
-            VALUE_BLOCK v_vals_packed;
+            MAKE_VECTOR_TYPE(INPUT2_TYPE, VALUE_VEC_SIZE) value_vals;
             unroll_for (uint i = 0; i < VALUE_VEC_SIZE; i++) {
-                v_vals_packed[i] = BLOCK_READN(INPUT2_TYPE, 1, value_cache, value_offset + i * HEAD_SIZE);
+                value_vals[i] = BLOCK_READN(INPUT2_TYPE, 1, value_cache, block_offset + i * HEAD_SIZE);
             }
 
-#if IS_KV_COMPRESSED
-            VALUE_BLOCK_UNCOMPRESSED value_vals;
-            unroll_for (uint i = 0; i < VALUE_VEC_SIZE; i++) {
-                value_vals[i] = (TO_VALUE_UNCOMPRESSED_TYPE(v_vals_packed[i]) - sub_group_broadcast(comp_zp, i)) * sub_group_broadcast(comp_scale, i);
-            }
-#else
-            VALUE_BLOCK value_vals = v_vals_packed;
-#endif
-
-            unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
-                OUTPUT_TYPE qk_val = slm_qk_vals[q_idx * SEQ_LEN_PARTITION_SIZE + block_num * PAGED_ATTENTION_BLOCK_SIZE + sglid];
+            OUTPUT_TYPE qk_val = slm_qk_vals[block_num * PAGED_ATTENTION_BLOCK_SIZE + sglid];
 
                 unroll_for (uint i = 0; i < VALUE_VEC_SIZE; i++) {
                     GET_VECTOR_ELEMENT(acc, q_idx) = mad(sub_group_broadcast(qk_val, i), value_vals[i], GET_VECTOR_ELEMENT(acc, q_idx));
@@ -494,73 +442,20 @@ KERNEL(pa_sdpa_opt)(
             }
         }
 
-
-#if SG_SCALE_FACTOR > 1
-        if (sgid >= SUBGROUPS_PER_WG / SG_SCALE_FACTOR) {
-#endif
         if (leftovers != 0) {
             const uint head_idx = head_num_idx / KV_HEADS_GROUP_SIZE;
             const uint last_block_idx = start_block_idx + blocks_num_per_partition;
-            const uint block_offset = block_indices[last_block_idx] * KV_HEADS_NUM * ADJUSTED_HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE + head_idx * ADJUSTED_HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE;
-            const uint value_offset = block_offset + head_size_idx;
-
-#if IS_KV_COMPRESSED
-            const uint value_comp_offset = block_offset + HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE;
-            INPUT0_TYPE* value_comp_ptr = value_cache + value_comp_offset;
-            INPUT0_TYPE comp_scale = value_comp_ptr[0 + sglid];
-            INPUT0_TYPE comp_zp = value_comp_ptr[PAGED_ATTENTION_BLOCK_SIZE + sglid];
-#endif
+            const uint block_offset = block_indices[last_block_idx] * HEAD_SIZE * KV_HEADS_NUM * PAGED_ATTENTION_BLOCK_SIZE + head_idx * HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE + sgid * SUBGROUP_SIZE;
 
             MAKE_VECTOR_TYPE(OUTPUT_TYPE, QUERIES_PER_WI) qk_val;
             unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
                 GET_VECTOR_ELEMENT(qk_val, q_idx) = slm_qk_vals[q_idx * SEQ_LEN_PARTITION_SIZE + blocks_num_per_partition * PAGED_ATTENTION_BLOCK_SIZE + sglid];
             }
             for (uint i = 0; i < leftovers; i++) {
-                INPUT2_TYPE value_packed = BLOCK_READN(INPUT2_TYPE, 1, value_cache, value_offset + i * HEAD_SIZE);
-#if IS_KV_COMPRESSED
-                #define VALUE_UNCOMPRESSED INPUT0_TYPE
-                #define TO_VALUE_UNCOMPRESSED_TYPE(val) CAT(convert_, VALUE_UNCOMPRESSED)(val)
-                VALUE_UNCOMPRESSED value_val = (TO_VALUE_UNCOMPRESSED_TYPE(value_packed) - sub_group_broadcast(comp_zp, i)) * sub_group_broadcast(comp_scale, i);
-#else
-                VALUE_UNCOMPRESSED value_val = value_packed;
-#endif
-
-                unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
-                    GET_VECTOR_ELEMENT(acc, q_idx) = mad(sub_group_broadcast(GET_VECTOR_ELEMENT(qk_val, q_idx), i), value_val, GET_VECTOR_ELEMENT(acc, q_idx));
-                }
+                INPUT2_TYPE value_val = BLOCK_READN(INPUT2_TYPE, 1, value_cache, block_offset + i * HEAD_SIZE);
+                acc = mad(sub_group_broadcast(qk_val, i), value_val, acc);
             }
         }
-
-
-#if SG_SCALE_FACTOR > 1
-        }
-#endif
-
-#if SG_SCALE_FACTOR > 1
-        // Reuse slm_qk_vals SLM to sum-up results between two sets of subgroups
-        __local OUTPUT_TYPE* tmp_reduction_slm_mem = (__local OUTPUT_TYPE*)&slm_qk_vals[0];
-        if ((partition_seq_len > (SEQ_LEN_PARTITION_SIZE / SG_SCALE_FACTOR)) || (leftovers != 0)) {
-            barrier(CLK_LOCAL_MEM_FENCE);
-
-            if (sgid >= SUBGROUPS_PER_WG / SG_SCALE_FACTOR) {
-                unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
-                    tmp_reduction_slm_mem[q_idx * HEAD_SIZE + head_size_idx] = GET_VECTOR_ELEMENT(acc, q_idx);
-                }
-            }
-
-            barrier(CLK_LOCAL_MEM_FENCE);
-
-            if (sgid < SUBGROUPS_PER_WG / SG_SCALE_FACTOR) {
-                unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
-                    GET_VECTOR_ELEMENT(acc, q_idx) += tmp_reduction_slm_mem[q_idx * HEAD_SIZE + head_size_idx];
-                }
-            }
-        }
-#endif
-
-#if SG_SCALE_FACTOR > 1
-        if (sgid < SUBGROUPS_PER_WG / SG_SCALE_FACTOR) {
-#endif
 
         if (seq_len > SEQ_LEN_PARTITION_SIZE) {
             unroll_for (uint q_idx = 0; q_idx < HEADS_PER_WI; q_idx++) {
@@ -591,9 +486,6 @@ KERNEL(pa_sdpa_opt)(
             }
         }
 
-#if SG_SCALE_FACTOR > 1
-        }
-#endif
     }
 }
 
