@@ -10,8 +10,19 @@
 
 #define SUBGROUPS_PER_WG ((V_HEAD_SIZE / SUBGROUP_SIZE) * SG_SCALE_FACTOR)
 #define PAGED_ATTENTION_BLOCKS_PER_PARTITION (SEQ_LEN_PARTITION_SIZE / PAGED_ATTENTION_BLOCK_SIZE)
+#define TURBOQUANT_LEVELS 16
+
+inline INPUT0_TYPE FUNC_CALL(turboquant_sign)(const uint idx) {
+    // Must match pa_kv_cache_update_ref.cl sign generation.
+    const uint mixed = idx * 2654435761u + 2246822519u;
+    return (popcount(mixed) & 1) ? (INPUT0_TYPE)-1.0f : (INPUT0_TYPE)1.0f;
+}
 
 #if K_HEAD_SIZE > 128 || V_HEAD_SIZE > 128 || HEADS_PER_WI > 1
+    #define STORE_QUERY_TO_SLM 1
+#endif
+
+#if IS_TURBOQUANT
     #define STORE_QUERY_TO_SLM 1
 #endif
 
@@ -135,6 +146,11 @@ KERNEL(pa_sdpa_opt)(
     const uint phys_adjusted_v_head_size = PACKED_ADJUSTED_V_HEAD_SIZE;
     const uint phys_k_head_size = PACKED_K_HEAD_SIZE;
     const uint phys_v_head_size = PACKED_V_HEAD_SIZE;
+#elif IS_TURBOQUANT
+    const uint phys_adjusted_k_head_size = ADJUSTED_K_HEAD_SIZE;
+    const uint phys_adjusted_v_head_size = ADJUSTED_V_HEAD_SIZE;
+    const uint phys_k_head_size = TURBOQUANT_PACKED_K_HEAD_SIZE;
+    const uint phys_v_head_size = V_HEAD_SIZE;
 #else
     const uint phys_adjusted_k_head_size = ADJUSTED_K_HEAD_SIZE;
     const uint phys_adjusted_v_head_size = ADJUSTED_V_HEAD_SIZE;
@@ -165,6 +181,9 @@ KERNEL(pa_sdpa_opt)(
 #ifdef STORE_QUERY_TO_SLM
     // SLM buffer for query inputs
     __local INPUT0_TYPE slm_query[K_HEAD_SIZE * QUERIES_PER_WI];
+#if IS_TURBOQUANT
+    __local INPUT0_TYPE slm_query_tq_tmp[K_HEAD_SIZE * QUERIES_PER_WI];
+#endif
 #endif
 
     // SLM for intermediate QK results
@@ -205,6 +224,42 @@ KERNEL(pa_sdpa_opt)(
         }
 
         barrier(CLK_LOCAL_MEM_FENCE);
+
+#if IS_KV_COMPRESSED && IS_TURBOQUANT
+        // TurboQuant read path expects Q in the same signed-Hadamard domain as K.
+        for (uint h = 0; h < QUERIES_PER_WI; h++) {
+            const uint base = h * K_HEAD_SIZE;
+            for (uint idx = sglid; idx < K_HEAD_SIZE; idx += SUBGROUP_SIZE) {
+                slm_query_tq_tmp[base + idx] = slm_query[base + idx] * FUNC_CALL(turboquant_sign)(idx);
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+
+            for (uint stride = 1; stride < K_HEAD_SIZE; stride <<= 1) {
+                for (uint pair_idx = sglid; pair_idx < (K_HEAD_SIZE >> 1); pair_idx += SUBGROUP_SIZE) {
+                    const uint block = (pair_idx / stride) * (stride << 1);
+                    const uint offset = pair_idx % stride;
+                    const uint idx0 = base + block + offset;
+                    const uint idx1 = idx0 + stride;
+                    const INPUT0_TYPE a = slm_query_tq_tmp[idx0];
+                    const INPUT0_TYPE b = slm_query_tq_tmp[idx1];
+                    slm_query[idx0] = a + b;
+                    slm_query[idx1] = a - b;
+                }
+                barrier(CLK_LOCAL_MEM_FENCE);
+
+                const INPUT0_TYPE inv_sqrt_dim = native_rsqrt((INPUT0_TYPE)K_HEAD_SIZE);
+                for (uint idx = sglid; idx < K_HEAD_SIZE; idx += SUBGROUP_SIZE) {
+                    slm_query_tq_tmp[base + idx] = slm_query[base + idx] * inv_sqrt_dim;
+                }
+                barrier(CLK_LOCAL_MEM_FENCE);
+            }
+
+            for (uint idx = sglid; idx < K_HEAD_SIZE; idx += SUBGROUP_SIZE) {
+                slm_query[base + idx] = slm_query_tq_tmp[base + idx];
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+#endif
 #else // !STORE_QUERY_TO_SLM
 
         INPUT0_TYPE q_val[K_HEAD_SIZE / SUBGROUP_SIZE];
@@ -259,7 +314,46 @@ KERNEL(pa_sdpa_opt)(
 #endif
 
             // Loop for qk_index
-#if IS_KV_COMPRESSED && IS_INT4_COMPRESSED
+#if IS_KV_COMPRESSED && IS_TURBOQUANT
+            MAKE_VECTOR_TYPE(INPUT0_TYPE, KEY_VEC_SIZE) k_vals[K_HEAD_SIZE / KEY_VEC_SIZE];
+
+            const uint key_norm_offset = key_block_offset + phys_k_head_size * PAGED_ATTENTION_BLOCK_SIZE;
+            INPUT0_TYPE* key_norm_ptr = key_cache + key_norm_offset;
+            INPUT0_TYPE comp_norm = key_norm_ptr[sglid];
+
+            unroll_for (uint qk_idx = 0; qk_idx < (K_HEAD_SIZE / KEY_VEC_SIZE); qk_idx++) {
+                const uint packed_group_idx = qk_idx / U4_ELEMS_PER_BYTE;
+                const uint packed_lane = qk_idx % U4_ELEMS_PER_BYTE;
+                unroll_for (uint i = 0; i < KEY_VEC_SIZE; i++) {
+                    uint index = key_block_offset + packed_group_idx * hidden_stride * KEY_VEC_SIZE + i * hidden_stride;
+                    char packed_cache = BLOCK_READN(INPUT1_TYPE, 1, key_cache, index);
+                    MAKE_VECTOR_TYPE(char, U4_ELEMS_PER_BYTE) buff = unpack_to_char(*(uint4x2_t *)&packed_cache);
+                    uchar idx_u4 = (packed_lane == 0) ? ((uchar)buff.s0 & (uchar)0x0f) : ((uchar)buff.s1 & (uchar)0x0f);
+                    INPUT0_TYPE centroid = mad((INPUT0_TYPE)idx_u4, (INPUT0_TYPE)TURBOQUANT_AFFINE_SCALE, (INPUT0_TYPE)TURBOQUANT_AFFINE_BIAS);
+                    k_vals[qk_idx][i] = centroid * comp_norm;
+                }
+            }
+
+            #if STORE_QUERY_TO_SLM
+                unroll_for (uint qk_idx = 0; qk_idx < K_HEAD_SIZE / KEY_VEC_SIZE; qk_idx++) {
+                    unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
+                        SOFTMAX_ACCUMULATOR_TYPE q_val = slm_query[q_idx * K_HEAD_SIZE + qk_idx * KEY_VEC_SIZE + sglid];
+                        unroll_for (uint i = 0; i < KEY_VEC_SIZE; i++) {
+                            GET_VECTOR_ELEMENT(qk_acc, q_idx) = mad(sub_group_broadcast(q_val, i), TO_SOFTMAX_ACCUMULATOR_TYPE(k_vals[qk_idx][i]), GET_VECTOR_ELEMENT(qk_acc, q_idx));
+                        }
+                    }
+                }
+            #else
+                unroll_for (uint qk_idx = 0; qk_idx < K_HEAD_SIZE / KEY_VEC_SIZE; qk_idx++) {
+                    unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
+                        unroll_for (uint i = 0; i < KEY_VEC_SIZE; i++) {
+                            qk_acc = mad(TO_SOFTMAX_ACCUMULATOR_TYPE(sub_group_broadcast(q_val[qk_idx], i)), TO_SOFTMAX_ACCUMULATOR_TYPE(k_vals[qk_idx][i]), qk_acc);
+                        }
+                    }
+                }
+            #endif
+
+#elif IS_KV_COMPRESSED && IS_INT4_COMPRESSED
             MAKE_VECTOR_TYPE(INPUT0_TYPE, KEY_VEC_SIZE) k_vals[K_HEAD_SIZE / KEY_VEC_SIZE];
 
             unroll_for (uint qk_idx = 0; qk_idx < (K_HEAD_SIZE / KEY_VEC_SIZE); qk_idx+=U4_ELEMS_PER_BYTE) {

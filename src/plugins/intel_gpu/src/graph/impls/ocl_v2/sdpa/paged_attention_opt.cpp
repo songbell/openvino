@@ -34,6 +34,8 @@ constexpr size_t paged_attention_block_size = 16;
 constexpr size_t seq_len_partition_size = 256;
 constexpr size_t subgroup_size = 16;
 constexpr size_t u4_elems_per_byte = 2;
+constexpr size_t turboquant_bits = 4;
+constexpr size_t turboquant_levels = 1u << turboquant_bits;
 
 inline bool get_kv_compressed(const RuntimeParams& params) {
     auto key_cache_layout = params.input_layouts[PagedAttentionInputIdx::KEY_CACHE];
@@ -285,7 +287,23 @@ public:
 
         const auto kv_cache_dt = params.get_program().get_config().get_kv_cache_precision();
         const bool is_kv_compressed = get_kv_compressed(params);
+        const auto key_quant_mode = params.get_program().get_config().get_key_cache_quant_mode();
+        const bool is_turboquant = is_kv_compressed && key_quant_mode == ov::internal::CacheQuantMode::TURBOQUANT;
+
+        int key_cache_quant_mode = 0;
+        if (is_kv_compressed) {
+            if (key_quant_mode == ov::internal::CacheQuantMode::BY_CHANNEL) {
+                key_cache_quant_mode = 1;
+            } else if (key_quant_mode == ov::internal::CacheQuantMode::BY_TOKEN) {
+                key_cache_quant_mode = 2;
+            } else if (key_quant_mode == ov::internal::CacheQuantMode::TURBOQUANT) {
+                key_cache_quant_mode = 3;
+            }
+        }
+
         jit.make("IS_KV_COMPRESSED", is_kv_compressed);
+        jit.make("KEY_CACHE_QUANT_MODE", key_cache_quant_mode);
+        jit.make("IS_TURBOQUANT", is_turboquant ? 1 : 0);
         jit.make("XE2_QK_MULTIPLICATION", params.get_device_info().arch == gpu_arch::xe2);
         jit.make("SG_SCALE_FACTOR", get_pa_sg_number_scale_factor(params.get_device_info(), desc->k_head_size, SDPAStage::SINGLE_TOKEN, is_kv_compressed));
 
@@ -299,7 +317,15 @@ public:
             jit.make("SCALE_ZP_SIZE_PER_TOKEN", scales_zp_size);
             jit.add(make_uint4_kv_cache_jit_constants(params));
 
-            if (is_key_by_channel) {
+            if (is_turboquant) {
+                OPENVINO_ASSERT(!is_key_by_channel, "TurboQuant requires by-token key cache quantization mode");
+                const auto packed_k_head_size = (desc->k_head_size * turboquant_bits) / 8;
+                jit.make("TURBOQUANT_PACKED_K_HEAD_SIZE", packed_k_head_size);
+                jit.make("TURBOQUANT_AFFINE_SCALE", static_cast<float>(2.0f / (turboquant_levels - 1)));
+                jit.make("TURBOQUANT_AFFINE_BIAS", -1.0f);
+                jit.make("ADJUSTED_K_HEAD_SIZE", packed_k_head_size + sizeof(ov::float16));
+                jit.make("ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE", paged_attention_block_size);
+            } else if (is_key_by_channel) {
                 jit.make("IS_KEY_BY_CHANNEL", 1);
                 jit.make("ADJUSTED_K_HEAD_SIZE", desc->k_head_size);
                 jit.make("ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE", paged_attention_block_size + scales_zp_size);
@@ -823,6 +849,8 @@ protected:
                 key_cache_quant_mode = 1;
             } else if (quant_mode == ov::internal::CacheQuantMode::BY_TOKEN) {
                 key_cache_quant_mode = 2;
+            } else if (quant_mode == ov::internal::CacheQuantMode::TURBOQUANT) {
+                key_cache_quant_mode = 3;
             }
         }
         jit.make("KEY_CACHE_QUANT_MODE", key_cache_quant_mode);
@@ -915,6 +943,8 @@ protected:
 
         const auto desc = params.typed_desc<paged_attention>();
         const auto kv_cache_dt = params.get_program().get_config().get_kv_cache_precision();
+        const auto key_quant_mode = params.get_program().get_config().get_key_cache_quant_mode();
+        const bool is_turboquant = key_quant_mode == ov::internal::CacheQuantMode::TURBOQUANT;
         const auto is_key_by_channel = desc->is_key_by_channel;
         OPENVINO_ASSERT(is_key_by_channel == (params.get_program().get_config().get_key_cache_quant_mode() == ov::internal::CacheQuantMode::BY_CHANNEL),
                         "[GPU] Paged Attention key cache quantization mode mismatch: prim.key_cache_by_channel : ",
@@ -935,6 +965,7 @@ protected:
 
         const bool is_kv_compressed = get_kv_compressed(params);
         jit.make("IS_KV_COMPRESSED", is_kv_compressed ? 1 : 0);
+        jit.make("IS_TURBOQUANT", (is_kv_compressed && is_turboquant) ? 1 : 0);
         if (is_kv_compressed) {
             auto data_type = params.input_layouts[PagedAttentionInputIdx::KEY].data_type;  // key tensor data size
             auto scales_zp_size = get_element_size(data_type) * 2;                         // scale + zp
@@ -944,7 +975,15 @@ protected:
             jit.make("SCALE_ZP_SIZE_PER_TOKEN", scales_zp_size);
             jit.add(make_uint4_kv_cache_jit_constants(params));
 
-            if (is_key_by_channel) {
+            if (is_turboquant) {
+                OPENVINO_ASSERT(!is_key_by_channel, "TurboQuant requires by-token key cache quantization mode");
+                const auto packed_k_head_size = (desc->k_head_size * turboquant_bits) / 8;
+                jit.make("TURBOQUANT_PACKED_K_HEAD_SIZE", packed_k_head_size);
+                jit.make("TURBOQUANT_AFFINE_SCALE", static_cast<float>(2.0f / (turboquant_levels - 1)));
+                jit.make("TURBOQUANT_AFFINE_BIAS", -1.0f);
+                jit.make("ADJUSTED_K_HEAD_SIZE", packed_k_head_size + sizeof(ov::float16));
+                jit.make("ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE", paged_attention_block_size);
+            } else if (is_key_by_channel) {
                 jit.make("IS_KEY_BY_CHANNEL", 1);
                 jit.make("ADJUSTED_K_HEAD_SIZE", desc->k_head_size);
                 jit.make("ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE", paged_attention_block_size + scales_zp_size);

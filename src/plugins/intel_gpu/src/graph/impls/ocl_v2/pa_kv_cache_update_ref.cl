@@ -7,6 +7,13 @@
 #include "include/batch_headers/int4_utils.cl"
 
 #define UINT4_RANGE 15
+#define TURBOQUANT_LEVELS 16
+
+inline ACCUMULATOR_TYPE FUNC_CALL(turboquant_sign)(const uint idx) {
+    // Deterministic pseudo-random +/-1 sign generation.
+    const uint mixed = idx * 2654435761u + 2246822519u;
+    return (popcount(mixed) & 1) ? (ACCUMULATOR_TYPE)-1.0f : (ACCUMULATOR_TYPE)1.0f;
+}
 
 inline void FUNC(quantize_and_save_per_token)(__global const INPUT0_TYPE* in_data,
                                     const uint in_data_offset,
@@ -69,6 +76,84 @@ inline void FUNC(quantize_and_save_per_token)(__global const INPUT0_TYPE* in_dat
     if (sglid == 0) {
         comp_ptr[token_pos_in_block] = 1.0 / scale;
         comp_ptr[PAGED_ATTENTION_BLOCK_SIZE + token_pos_in_block] = zp;
+    }
+}
+
+inline void FUNC(quantize_and_save_turboquant_per_token)(__global const INPUT0_TYPE* in_data,
+                                    const uint in_data_offset,
+                                    __global OUTPUT_TYPE* out_data,
+                                    const uint out_data_offset,
+                                    const uint out_data_pitch,
+                                    const uint comp_offset,
+                                    const uint token_pos_in_block,
+                                    const uint sglid,
+                                    const uint num_groups,
+                                    INPUT0_TYPE* input_data,
+                                    __local ACCUMULATOR_TYPE* tq_tmp0,
+                                    __local ACCUMULATOR_TYPE* tq_tmp1) {
+    ACCUMULATOR_TYPE sq_sum_local = 0.0f;
+    unroll_for (uint i = 0; i < num_groups; i++) {
+        input_data[i] = BLOCK_READN(INPUT0_TYPE, 1, in_data, in_data_offset + i * SUBGROUP_SIZE);
+        ACCUMULATOR_TYPE v = (ACCUMULATOR_TYPE)input_data[i];
+        sq_sum_local += v * v;
+    }
+
+    ACCUMULATOR_TYPE norm = sub_group_reduce_add(sq_sum_local);
+    norm = native_sqrt(norm);
+    norm = fmax(norm, (ACCUMULATOR_TYPE)1e-8f);
+    ACCUMULATOR_TYPE inv_norm = (ACCUMULATOR_TYPE)1.0f / norm;
+
+    // Step3 (TurboQuant): apply deterministic signs and Hadamard rotation.
+    unroll_for (uint i = 0; i < num_groups; i++) {
+        const uint dim_idx = i * SUBGROUP_SIZE + sglid;
+        const ACCUMULATOR_TYPE sign = FUNC_CALL(turboquant_sign)(dim_idx);
+        tq_tmp0[dim_idx] = ((ACCUMULATOR_TYPE)input_data[i] * inv_norm) * sign;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (uint stride = 1; stride < K_HEAD_SIZE; stride <<= 1) {
+        for (uint pair_idx = sglid; pair_idx < (K_HEAD_SIZE >> 1); pair_idx += SUBGROUP_SIZE) {
+            const uint block = (pair_idx / stride) * (stride << 1);
+            const uint offset = pair_idx % stride;
+            const uint idx0 = block + offset;
+            const uint idx1 = idx0 + stride;
+            const ACCUMULATOR_TYPE a = tq_tmp0[idx0];
+            const ACCUMULATOR_TYPE b = tq_tmp0[idx1];
+            tq_tmp1[idx0] = a + b;
+            tq_tmp1[idx1] = a - b;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        for (uint dim_idx = sglid; dim_idx < K_HEAD_SIZE; dim_idx += SUBGROUP_SIZE) {
+            tq_tmp0[dim_idx] = tq_tmp1[dim_idx];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    const ACCUMULATOR_TYPE inv_sqrt_dim = native_rsqrt((ACCUMULATOR_TYPE)K_HEAD_SIZE);
+
+    unroll_for (uint i = 0; i < num_groups; i += U4_ELEMS_PER_BYTE) {
+        const uint dim0 = i * SUBGROUP_SIZE + sglid;
+        ACCUMULATOR_TYPE x0 = clamp(tq_tmp0[dim0] * inv_sqrt_dim, (ACCUMULATOR_TYPE)-1.0f, (ACCUMULATOR_TYPE)1.0f);
+        int idx0 = convert_int_rte((x0 + (ACCUMULATOR_TYPE)1.0f) * (ACCUMULATOR_TYPE)7.5f);
+        idx0 = clamp(idx0, 0, 15);
+
+        int idx1 = 0;
+        if (i + 1 < num_groups) {
+            const uint dim1 = (i + 1) * SUBGROUP_SIZE + sglid;
+            ACCUMULATOR_TYPE x1 = clamp(tq_tmp0[dim1] * inv_sqrt_dim, (ACCUMULATOR_TYPE)-1.0f, (ACCUMULATOR_TYPE)1.0f);
+            idx1 = convert_int_rte((x1 + (ACCUMULATOR_TYPE)1.0f) * (ACCUMULATOR_TYPE)7.5f);
+            idx1 = clamp(idx1, 0, 15);
+        }
+
+        char2 packed_pair = (char2)(idx0, idx1);
+        uint packed_output_offset = out_data_offset + ((i / U4_ELEMS_PER_BYTE) * SUBGROUP_SIZE + sglid) * out_data_pitch;
+        out_data[packed_output_offset] = cvt_int8x2_to_uint4x2(packed_pair);
+    }
+
+    INPUT0_TYPE* comp_ptr = out_data + comp_offset;
+    if (sglid == 0) {
+        comp_ptr[token_pos_in_block] = (INPUT0_TYPE)norm;
     }
 }
 
@@ -425,11 +510,21 @@ KERNEL(pa_kv_cache_update)(
     const uint phys_adjusted_v_head_size = PACKED_ADJUSTED_V_HEAD_SIZE;
     const uint phys_k_head_size = PACKED_K_HEAD_SIZE;
     const uint phys_v_head_size = PACKED_V_HEAD_SIZE;
+#elif IS_TURBOQUANT
+    const uint phys_adjusted_k_head_size = ADJUSTED_K_HEAD_SIZE;
+    const uint phys_adjusted_v_head_size = ADJUSTED_V_HEAD_SIZE;
+    const uint phys_k_head_size = TURBOQUANT_PACKED_K_HEAD_SIZE;
+    const uint phys_v_head_size = V_HEAD_SIZE;
 #else
     const uint phys_adjusted_k_head_size = ADJUSTED_K_HEAD_SIZE;
     const uint phys_adjusted_v_head_size = ADJUSTED_V_HEAD_SIZE;
     const uint phys_k_head_size = K_HEAD_SIZE;
     const uint phys_v_head_size = V_HEAD_SIZE;
+#endif
+
+#if IS_TURBOQUANT
+    __local ACCUMULATOR_TYPE turboquant_tmp0[K_HEAD_SIZE];
+    __local ACCUMULATOR_TYPE turboquant_tmp1[K_HEAD_SIZE];
 #endif
 
     if (!is_prefill_stage) {
@@ -521,9 +616,15 @@ KERNEL(pa_kv_cache_update)(
         {
             const uint comp_k_offset = block_k_base_offset + phys_k_head_size * PAGED_ATTENTION_BLOCK_SIZE;
             // key processing
+#if IS_TURBOQUANT
+            INPUT0_TYPE input_k_data[K_HEAD_SIZE / SUBGROUP_SIZE];
+            FUNC_CALL(quantize_and_save_turboquant_per_token)(key_data, key_in_offset, key_cache_data, key_out_offset, PAGED_ATTENTION_BLOCK_SIZE, comp_k_offset,
+                current_token_pos_in_block, sglid, K_HEAD_SIZE / SUBGROUP_SIZE, &input_k_data[0], turboquant_tmp0, turboquant_tmp1);
+#else
             INPUT0_TYPE input_k_data[K_HEAD_SIZE / SUBGROUP_SIZE];
             FUNC_CALL(quantize_and_save_per_token)(key_data, key_in_offset, key_cache_data, key_out_offset, PAGED_ATTENTION_BLOCK_SIZE, comp_k_offset,
                 current_token_pos_in_block, sglid, K_HEAD_SIZE / SUBGROUP_SIZE, &input_k_data[0]);
+#endif
 
             const uint comp_v_offset = block_v_base_offset + phys_v_head_size * PAGED_ATTENTION_BLOCK_SIZE;
             INPUT0_TYPE input_v_data[V_HEAD_SIZE / SUBGROUP_SIZE];
@@ -729,9 +830,15 @@ KERNEL(pa_kv_cache_update)(
             #else // IS_KV_COMPRESSED
             {
                 // Key per token
+#if IS_TURBOQUANT
+                INPUT0_TYPE input_k_data[K_HEAD_SIZE / SUBGROUP_SIZE];
+                FUNC_CALL(quantize_and_save_turboquant_per_token)(key_data, key_in_offset, key_cache_data, key_out_offset, PAGED_ATTENTION_BLOCK_SIZE,
+                    comp_k_offset, token_num, sglid, K_HEAD_SIZE / SUBGROUP_SIZE, &input_k_data[0], turboquant_tmp0, turboquant_tmp1);
+#else
                 INPUT0_TYPE input_k_data[K_HEAD_SIZE / SUBGROUP_SIZE];
                 FUNC_CALL(quantize_and_save_per_token)(key_data, key_in_offset, key_cache_data, key_out_offset, PAGED_ATTENTION_BLOCK_SIZE,
                     comp_k_offset, token_num, sglid, K_HEAD_SIZE / SUBGROUP_SIZE, &input_k_data[0]);
+#endif
 
                 // Value per token
                 INPUT0_TYPE input_v_data[V_HEAD_SIZE / SUBGROUP_SIZE];
@@ -811,9 +918,15 @@ KERNEL(pa_kv_cache_update)(
             #else // IS_KV_COMPRESSED
                 {
                     // key processing
+#if IS_TURBOQUANT
+                    INPUT0_TYPE input_k_data[K_HEAD_SIZE / SUBGROUP_SIZE];
+                    FUNC_CALL(quantize_and_save_turboquant_per_token)(key_data, key_in_offset, key_cache_data, key_out_offset, PAGED_ATTENTION_BLOCK_SIZE,
+                        comp_k_offset, token_start_pos_key + token_num, sglid, K_HEAD_SIZE / SUBGROUP_SIZE, &input_k_data[0], turboquant_tmp0, turboquant_tmp1);
+#else
                     INPUT0_TYPE input_k_data[K_HEAD_SIZE / SUBGROUP_SIZE];
                     FUNC_CALL(quantize_and_save_per_token)(key_data, key_in_offset, key_cache_data, key_out_offset, PAGED_ATTENTION_BLOCK_SIZE,
                         comp_k_offset, token_start_pos_key + token_num, sglid, K_HEAD_SIZE / SUBGROUP_SIZE, &input_k_data[0]);
+#endif
 
                     // value processing
                     INPUT0_TYPE input_v_data[V_HEAD_SIZE / SUBGROUP_SIZE];
