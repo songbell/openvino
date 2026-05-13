@@ -239,6 +239,25 @@ static std::tuple<std::shared_ptr<ov::Node>, std::shared_ptr<ov::Node>> gptoss_g
     return {mask, offset};
 }
 
+// Match torch-style KV current branch used in some speculative decoding models:
+//   k_ctx = k_proj(target_hidden), k_noise = k_proj(hidden_states), k = cat([k_ctx, k_noise], dim=1)
+//   v_ctx = v_proj(target_hidden), v_noise = v_proj(hidden_states), v = cat([v_ctx, v_noise], dim=1)
+//   k/v are then reshaped and (optionally) transposed before cache update.
+static std::shared_ptr<ov::Node> kv_ctx_noise_current_pattern() {
+    auto kv_ctx = any_input();
+    auto kv_noise = any_input();
+    auto kv_cat = wrap_type<v0::Concat>({kv_ctx, kv_noise}, [](const ov::Output<ov::Node>& out) {
+        auto concat = ov::as_type_ptr<v0::Concat>(out.get_node_shared_ptr());
+        return concat && concat->get_axis() == 1;
+    });
+
+    auto kv_reshape = wrap_type<v1::Reshape>({kv_cat, any_input()});
+    auto kv_transpose = wrap_type<v1::Transpose>({kv_reshape, any_input()});
+    auto kv_unsqueeze = wrap_type<v0::Unsqueeze>({kv_cat, any_input()});
+
+    return std::make_shared<Or>(OutputVector{kv_cat, kv_reshape, kv_transpose, kv_unsqueeze});
+}
+
 static std::shared_ptr<v0::Parameter> named_parameter(std::shared_ptr<v0::Parameter> node, const std::string& name) {
     // Set name for both node and output tensor (should be only one tensor, and any other names will be overriden by a
     // given single name)
@@ -253,7 +272,7 @@ typedef std::
         node_tuple;
 
 static node_tuple kv_read_and_concat(ov::Output<ov::Node> kv_current) {
-    auto kv_past_var = wrap_type<ov::op::util::ReadValueBase>({any_input()});
+    auto kv_past_var = wrap_type<ov::op::util::ReadValueBase>();
     auto kv_past = wrap_type<v8::Gather>({kv_past_var, any_input(), any_input()});
     kv_past = optional<v1::Transpose>({kv_past, any_input()});  // Transpose is used when kv-cache is stored
                                                                 // in a not usual layout, example: bloom
@@ -326,11 +345,15 @@ ov::pass::StateManagementPattern::StateManagementPattern(
     std::unordered_set<std::string>& var_ids_to_remove) {
     MATCHER_SCOPE(StateManagementPattern);
 
-    auto k_current = any_input();
+    auto k_current_default = any_input();
+    auto k_current_ctx_noise = kv_ctx_noise_current_pattern();
+    auto k_current = std::make_shared<Or>(OutputVector{k_current_default, k_current_ctx_noise});
     std::shared_ptr<ov::Node> k_past_var, k_current2, k_concat, k_current_reshaped;
     std::tie(k_past_var, k_current2, k_current_reshaped, k_concat) = kv_read_and_concat(k_current);
 
-    auto v_current = any_input();
+    auto v_current_default = any_input();
+    auto v_current_ctx_noise = kv_ctx_noise_current_pattern();
+    auto v_current = std::make_shared<Or>(OutputVector{v_current_default, v_current_ctx_noise});
     std::shared_ptr<ov::Node> v_past_var, v_current2, v_concat, v_current_reshaped;
     std::tie(v_past_var, v_current2, v_current_reshaped, v_concat) = kv_read_and_concat(v_current);
 
@@ -448,6 +471,10 @@ ov::pass::StateManagementPattern::StateManagementPattern(
                                           &adaptive_rkv_diversity_results,
                                           &var_ids_to_remove](Matcher& m) {
         const auto& pattern_map = m.get_pattern_value_map();
+        std::cout << "[DEBUG] ====== SDPA Pattern MATCHED! ======" << std::endl;
+        std::cout << "[DEBUG] Pattern: " << matcher_name << std::endl;
+        std::cout << "[DEBUG] Pattern map size: " << pattern_map.size() << std::endl;
+
         const auto& real_q = pattern_map.at(q);
 
         auto sdpa_node = pattern_map
@@ -455,6 +482,14 @@ ov::pass::StateManagementPattern::StateManagementPattern(
                                  : pattern_map.count(sdpa_with_5_inputs) ? sdpa_with_5_inputs
                                                                          : sdpa_with_6_inputs)
                              .get_node();
+
+        std::cout << "[DEBUG] SDPA node: " << sdpa_node->get_friendly_name() << std::endl;
+        std::cout << "[DEBUG] SDPA inputs: " << sdpa_node->get_input_size() << std::endl;
+        for (size_t i = 0; i < sdpa_node->get_input_size(); i++) {
+            auto input_node = sdpa_node->get_input_node_shared_ptr(i);
+            std::cout << "[DEBUG]   Input[" << i << "]: " << input_node->get_type_name()
+                      << " - " << input_node->get_friendly_name() << std::endl;
+        }
 
         auto k_head_size_dim = sdpa_node->get_input_tensor(1).get_partial_shape()[-1];  // E from SDPA spec.
         auto v_head_size_dim = sdpa_node->get_input_tensor(2)
@@ -812,7 +847,16 @@ ov::pass::StateManagementPattern::StateManagementPattern(
         replace_node(m.get_match_root(), pa_transpose);
         return true;
     };
-
+    ov::matcher_pass_callback test_callback = [=](Matcher& m) {
+        const auto& pattern_map = m.get_pattern_value_map();
+        std::cout << "[DEBUG] Testing pattern: " << matcher_name << std::endl;
+        std::cout << "[DEBUG]   Matched node: " << m.get_match_root()->get_friendly_name()
+                  << " type: " << m.get_match_root()->get_type_name() << std::endl;
+        std::cout << "[DEBUG]   Pattern map size: " << pattern_map.size() << std::endl;
+        return true;
+    };
+    auto m_test = std::make_shared<Matcher>(k_to_sdpa, matcher_name + "_test");
+    register_matcher(m_test, test_callback);
     auto m = std::make_shared<Matcher>(sdpa_variants, matcher_name);
     register_matcher(m, callback);
 }

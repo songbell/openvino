@@ -33,6 +33,7 @@ bool IncreaseRMSInputPrecision::run_on_model(const std::shared_ptr<ov::Model>& m
     SymbolicOptimizations symbolic_optimizations(false, get_pass_config());
     auto symbolic_ctx_manager = symbolic_optimizations.get_manager();
     symbolic_ctx_manager->register_pass<IncreasePrecisionForQwenVLMerger>();
+    symbolic_ctx_manager->register_pass<IncreasePrecisionForDraftModelHiddenNormRMS>();
     symbolic_ctx_manager->register_pass<Validate>();
     return symbolic_optimizations.run_on_model(model);
 }
@@ -102,6 +103,50 @@ IncreasePrecisionForQwenVLMerger::IncreasePrecisionForQwenVLMerger() {
     };
 
     auto m = std::make_shared<ov::pass::pattern::Matcher>(merger_mlp2, "IncreasePrecisionForQwenVLMerger");
+    this->register_matcher(m, callback);
+}
+
+IncreasePrecisionForDraftModelHiddenNormRMS::IncreasePrecisionForDraftModelHiddenNormRMS() {
+    using namespace ov::pass::pattern;
+
+    auto const_or_convert = std::make_shared<ov::pass::pattern::op::Or>(OutputVector{
+        wrap_type<ov::op::v0::Constant>(),
+        wrap_type<ov::op::v0::Convert>({wrap_type<ov::op::v0::Constant>()})
+    });
+
+    auto rms_m = wrap_type<ov::op::internal::RMS>({any_input(), const_or_convert}, type_matches(element::f16));
+
+    ov::matcher_pass_callback callback = [OV_CAPTURE_CPY_AND_THIS](ov::pass::pattern::Matcher& m) {
+        const auto& pattern_map = m.get_pattern_value_map();
+        auto rms = ov::as_type_ptr<ov::op::internal::RMS>(pattern_map.at(rms_m).get_node_shared_ptr());
+        if (!rms || transformation_callback(rms)) {
+            return false;
+        }
+
+        static const std::string target_name = "__module.model.hidden_norm/aten::mul/Multiply_1";
+        if (rms->get_friendly_name() != target_name) {
+            return false;
+        }
+
+        const auto desired_et = ov::element::f32;
+        const auto original_et = rms->get_output_element_type(0);
+        if (original_et == desired_et) {
+            return false;
+        }
+
+        size_t input_idx = 0;
+        bool is_changed = insert_converts_before_if_needed(rms, desired_et, input_idx);
+        if (!is_changed) {
+            return false;
+        }
+
+        size_t output_idx = 0;
+        insert_converts_after_if_needed(rms, original_et, output_idx);
+        ov::disable_fp16_compression(rms);
+        return true;
+    };
+
+    auto m = std::make_shared<ov::pass::pattern::Matcher>(rms_m, "IncreasePrecisionForDraftModelHiddenNormRMS");
     this->register_matcher(m, callback);
 }
 }  // namespace ov::intel_gpu

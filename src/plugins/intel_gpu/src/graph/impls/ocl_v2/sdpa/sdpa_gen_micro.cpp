@@ -812,7 +812,10 @@ void SDPAMicroGenerator::init_sdpa_configuration(const kernel_impl_params& impl_
         sdpa_config.heads_num = desc->heads_num;
         sdpa_config.kv_heads_num = desc->kv_heads_num;
         sdpa_config.has_alibi_input = desc->has_alibi;
-        sdpa_config.is_causal = true;
+        if (desc->has_qq_bias)
+            sdpa_config.is_causal = false;
+        else
+            sdpa_config.is_causal = true; // temp solution
         sdpa_config.is_paged_attention = true;
         sdpa_config.paged_attention_block_size = static_cast<int64_t>(paged_attention::block_size);
         sdpa_config.paged_attention_sliding_window = desc->sliding_window;

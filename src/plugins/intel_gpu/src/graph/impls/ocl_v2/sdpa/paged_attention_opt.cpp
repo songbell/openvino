@@ -129,6 +129,16 @@ static int64_t get_aligned_seq_len(const kernel_impl_params& impl_param, const P
     // we can reuse block_indices_shape[0] size to determine total aligned sequences length size, avoiding
     // memory access at runtime, because vLLM internally uses similar logic to configure blocks for KV cache
 
+    // Check if qq_bias is enabled and get key/query lengths
+    const auto desc = impl_param.typed_desc<paged_attention>();
+    const bool has_qq_bias = desc->has_qq_bias;
+    const auto& query_layout = impl_param.get_input_layout(PagedAttentionInputIdx::QUERY);
+    const auto& key_layout = impl_param.get_input_layout(PagedAttentionInputIdx::KEY);
+    const auto query_len = query_layout.get_partial_shape()[0].get_length();
+    const auto key_len = key_layout.get_partial_shape()[0].get_length();
+    const auto len_diff = key_len - query_len;
+    const bool use_key_len_for_blocks = has_qq_bias && (len_diff > 0);
+
     auto calculate_aligned_seq_len = [&]() {
         const auto& input_mem = impl_param.memory_deps;
         const auto subsequence_begins_mem = input_mem.at(PagedAttentionInputIdx::SUBSEQUENCE_BEGINS);
@@ -142,6 +152,14 @@ static int64_t get_aligned_seq_len(const kernel_impl_params& impl_param, const P
             for (size_t i = 0; i < subsequence_begins_mem_lock.size() - 1; i++) {
                 auto past_len = past_lens_mem_lock[i];
                 int64_t seq_length = subsequence_begins_mem_lock[i + 1] - subsequence_begins_mem_lock[i];
+
+                // When qq_bias is enabled and key_len > query_len, use key_len instead of seq_length
+                if (use_key_len_for_blocks) {
+                    seq_length = key_len;
+                    // In qq_bias case, the adjusted past_len should be used for calculating occupied slots
+                    // because past_len from query perspective doesn't reflect actual KV cache state
+                    past_len = past_len - len_diff;
+                }
 
                 // Since in MIXED execution mode the present KV-cache can be appended to the past KV-cache at any offset inside block,
                 // to ensure proper alignment and update_kv_cache kernel scheduling, we need to account for the number of unaligned tokens
@@ -918,6 +936,10 @@ protected:
             jit.add(make_layout_jit_constants("INPUT" + to_code_string(i), params.input_layouts[tensor_id], in_offsets_map.at(tensor_id)));
         }
 
+        // Add QUERY input layout constants for calculating query_len in kernel
+        constexpr size_t query_id = PagedAttentionInputIdx::QUERY;
+        jit.add(make_layout_jit_constants("QUERY_INPUT", params.input_layouts[query_id], in_offsets_map.at(query_id)));
+
         constexpr size_t key_cache_id = PagedAttentionInputIdx::KEY_CACHE;
         constexpr size_t value_cache_id = PagedAttentionInputIdx::VALUE_CACHE;
 
@@ -1020,8 +1042,8 @@ protected:
                 wgs.global = {blocks_number, heads_number, subgroup_size};
                 wgs.local = {1, 1, subgroup_size};
             } else {
-                const auto& key_input = params.input_layouts[0];
-                const auto sequences_number = key_input.get_partial_shape()[0].get_length();
+                const auto& key_input = params.input_layouts[PagedAttentionInputIdx::KEY];
+            const auto sequences_number = key_input.get_partial_shape()[0].get_length();
                 size_t head_size_partition = get_num_k_head_size_partitions(desc->is_key_by_channel, desc->k_head_size);
                 const auto kv_cache_dt = params.get_program().get_config().get_kv_cache_precision();
                 if (data_type_traits::is_i4_u4(kv_cache_dt) && head_size_partition > 1)
@@ -1471,50 +1493,84 @@ public:
         kernel_dump_info.clear_entries();
         auto rt_params = static_cast<PagedAttentionRuntimeParams*>(m_rt_params.get());
         assert(rt_params != nullptr);
+        auto& stream = instance.get_network().get_stream();
+
+        GPU_DEBUG_LOG << "[PA Debug] Stage: " << static_cast<int>(rt_params->stage)
+                      << ", has_rotated_blocks: " << has_rotated_blocks << std::endl;
+
         prepare_internal_buffers(static_cast<paged_attention_inst&>(instance), rt_params->stage, rt_params->use_micro_sdpa, rt_params->query_block_size);
+        GPU_DEBUG_LOG << "[PA Debug] prepare_internal_buffers completed" << std::endl;
+
         std::vector<event::ptr> res_event = events;
         if (has_rotated_blocks) {
             const auto& rotated_block_indices_input = params.get_input_layout(PagedAttentionInputIdx::ROTATED_BLOCK_INDICES);
             if (rotated_block_indices_input.get_partial_shape()[0].get_length() > 0) {
+                GPU_DEBUG_LOG << "[PA Debug] Executing kv_cache_rotate" << std::endl;
                 res_event = {execute_stage(res_event, instance, kv_cache_rotate)};
+                GPU_DEBUG_LOG << "[PA Debug] kv_cache_rotate completed" << std::endl;
             }
         }
+
+        GPU_DEBUG_LOG << "[PA Debug] Executing kv_cache_update" << std::endl;
         res_event = {execute_stage(res_event, instance, kv_cache_update)};
+        GPU_DEBUG_LOG << "[PA Debug] kv_cache_update completed" << std::endl;
 
         if (rt_params->stage == PagedAttentionStage::PREFILL) {
+            GPU_DEBUG_LOG << "[PA Debug] PREFILL stage" << std::endl;
 #ifdef ENABLE_ONEDNN_FOR_GPU
-            if (rt_params->use_micro_sdpa)
+            if (rt_params->use_micro_sdpa) {
+                GPU_DEBUG_LOG << "[PA Debug] Executing pa_sdpa_micro" << std::endl;
                 res_event = {execute_stage(res_event, instance, pa_sdpa_micro)};
-            else
+                GPU_DEBUG_LOG << "[PA Debug] pa_sdpa_micro completed" << std::endl;
+            } else
 #endif
+            {
+                GPU_DEBUG_LOG << "[PA Debug] Executing pa_sdpa_opt" << std::endl;
                 res_event = {execute_stage(res_event, instance, pa_sdpa_opt)};
+                GPU_DEBUG_LOG << "[PA Debug] pa_sdpa_opt completed" << std::endl;
+            }
         } else if (rt_params->stage == PagedAttentionStage::GENERATE || rt_params->stage == PagedAttentionStage::MIXED) {
             const auto multi_tokens_mode = rt_params->stage == PagedAttentionStage::MIXED;
+            GPU_DEBUG_LOG << "[PA Debug] " << (multi_tokens_mode ? "MIXED" : "GENERATE") << " stage" << std::endl;
             auto num_of_partitions = rt_params->num_of_partitions;
             if (rt_params->use_gqa_kernel && !rt_params->use_micro_sdpa) {
+                GPU_DEBUG_LOG << "[PA Debug] Executing " << (multi_tokens_mode ? "pa_multi_token" : "pa_gqa_single_token") << std::endl;
                 res_event = {execute_stage(res_event, instance, multi_tokens_mode ? pa_multi_token : pa_gqa_single_token)};
+                GPU_DEBUG_LOG << "[PA Debug] " << (multi_tokens_mode ? "pa_multi_token" : "pa_gqa_single_token") << " completed" << std::endl;
             } else {
 #ifdef ENABLE_ONEDNN_FOR_GPU
-                if (multi_tokens_mode && rt_params->use_micro_sdpa)
+                if (multi_tokens_mode && rt_params->use_micro_sdpa) {
+                    GPU_DEBUG_LOG << "[PA Debug] Executing pa_sdpa_micro_mixed" << std::endl;
                     res_event = {execute_stage(res_event, instance, pa_sdpa_micro_mixed)};
-                else
+                    GPU_DEBUG_LOG << "[PA Debug] pa_sdpa_micro_mixed completed" << std::endl;
+                } else
 #endif
+                {
+                    GPU_DEBUG_LOG << "[PA Debug] Executing " << (multi_tokens_mode ? "pa_multi_token" : "pa_single_token") << std::endl;
                     res_event = {execute_stage(res_event, instance, multi_tokens_mode ? pa_multi_token : pa_single_token)};
+                    GPU_DEBUG_LOG << "[PA Debug] " << (multi_tokens_mode ? "pa_multi_token" : "pa_single_token") << " completed" << std::endl;
+                }
             }
             if (num_of_partitions > 1 && !rt_params->use_micro_sdpa) {
+                GPU_DEBUG_LOG << "[PA Debug] Executing " << (multi_tokens_mode ? "pa_multi_token_finalization" : "pa_single_token_finalization") << std::endl;
                 res_event = {execute_stage(res_event, instance, multi_tokens_mode ? pa_multi_token_finalization : pa_single_token_finalization)};
+                GPU_DEBUG_LOG << "[PA Debug] " << (multi_tokens_mode ? "pa_multi_token_finalization" : "pa_single_token_finalization") << " completed" << std::endl;
             }
         }
 
         if (has_scores_output) {
+            GPU_DEBUG_LOG << "[PA Debug] Executing pa_scores_calc" << std::endl;
             res_event = {execute_stage(res_event, instance, pa_scores_calc)};
+            GPU_DEBUG_LOG << "[PA Debug] pa_scores_calc completed" << std::endl;
         }
 
         if (has_adaptive_rkv) {
             // Check layout to see if evictable_sizes has data before executing diversity kernel
             const auto& evictable_sizes_layout = params.get_input_layout(PagedAttentionInputIdx::ADAPTIVE_RKV_EVICTABLE_SIZES);
             if (evictable_sizes_layout.count() > 0) {
+                GPU_DEBUG_LOG << "[PA Debug] Executing pa_diversity_calc" << std::endl;
                 res_event = {execute_stage(res_event, instance, pa_diversity_calc)};
+                GPU_DEBUG_LOG << "[PA Debug] pa_diversity_calc completed" << std::endl;
             }
         }
 
@@ -1588,6 +1644,7 @@ public:
 
         std::vector<BufferDescriptor> internal_buffers;
         const auto desc = params.typed_desc<paged_attention>();
+        const bool has_qq_bias = desc->has_qq_bias;
         const auto indexes_dt = ov::element::u8;
         const auto element_size = 4;  // 4 bytes
         const int64_t target_seq_len_block_size = 16;
@@ -1701,10 +1758,36 @@ public:
 
 #ifdef ENABLE_ONEDNN_FOR_GPU
         if (can_use_micro_sdpa) {
-            const auto wg_tile_q = 8;  // This is set as the minimum size of query block for sharing between sdpa_micro_prefill and mixed.
-            const auto target_seq_len = std::max(paged_attention_aligned_seq_len, static_cast<int64_t>(1));
-            const auto indexes_buf_size = ceil_div(target_seq_len, wg_tile_q) * 2;
+            const int64_t wg_tile_q = 8;  // This is set as the minimum size of query block for sharing between sdpa_micro_prefill and mixed.
+            // Micro SDPA buffer should be based on query length, not key length (even in qq_bias case)
+            // because micro SDPA processes query blocks and attends to all keys
+            int64_t micro_target_seq_len = paged_attention_aligned_seq_len;
+
+            // In qq_bias case, paged_attention_aligned_seq_len is based on key_len
+            // We need to recalculate based on query_len for micro SDPA buffer
+            if (has_qq_bias && !params.is_dynamic()) {
+                const auto& query_layout = params.get_input_layout(PagedAttentionInputIdx::QUERY);
+                const auto& key_layout = params.get_input_layout(PagedAttentionInputIdx::KEY);
+                const int64_t query_len = query_layout.get_partial_shape()[0].get_length();
+                const int64_t key_len = key_layout.get_partial_shape()[0].get_length();
+                if (key_len > query_len) {
+                    // Recalculate aligned length based on query_len
+                    // Use wg_tile_q as the alignment size for micro SDPA
+                    micro_target_seq_len = align_to(query_len, wg_tile_q);
+                    GPU_DEBUG_LOG << "[PA get_internal_buffer_descs] qq_bias detected, "
+                                  << "using query_len for micro SDPA: micro_target_seq_len=" << micro_target_seq_len
+                                  << " (was " << paged_attention_aligned_seq_len << ")" << std::endl;
+                }
+            }
+
+            const int64_t target_seq_len = std::max(micro_target_seq_len, static_cast<int64_t>(1));
+            const int64_t indexes_buf_size = ceil_div(target_seq_len, wg_tile_q) * 2;
             internal_buffers.emplace_back(indexes_buf_size * 4, indexes_dt, lockable, not_shareable);
+
+            GPU_DEBUG_LOG << "[PA get_internal_buffer_descs] Micro SDPA buffer: target_seq_len=" << target_seq_len
+                          << ", wg_tile_q=" << wg_tile_q
+                          << ", indexes_buf_size=" << indexes_buf_size
+                          << ", buffer_bytes=" << (indexes_buf_size * 4) << std::endl;
         }
 #endif
 
@@ -1755,6 +1838,7 @@ public:
         const auto& desc = instance.get_impl_params()->typed_desc<paged_attention>();
         const bool has_scores_output = desc->has_scores_output();
         const bool has_score_aggregation = desc->has_score_aggregation;
+        const bool has_qq_bias = desc->has_qq_bias;
 
         if ((stage == PagedAttentionStage::UNKNOWN) || (stage == PagedAttentionStage::GENERATE && !has_scores_output && !use_micro_sdpa))
             return;
@@ -1763,6 +1847,17 @@ public:
         const auto past_lens_mem = instance.past_lens_memory_ptr();
         const auto subsequence_begins_mem = instance.subsequence_begins_memory_ptr();
         const auto& intermediates_memories = instance.get_intermediates_memories();
+
+        // Get query_len and key_len from input layouts when qq_bias is enabled
+        const auto& impl_params = instance.get_impl_params();
+        const auto& query_layout = impl_params->get_input_layout(PagedAttentionInputIdx::QUERY);
+        const auto& key_layout = impl_params->get_input_layout(PagedAttentionInputIdx::KEY);
+        const auto query_len = query_layout.get_partial_shape()[0].get_length();
+        const auto key_len = key_layout.get_partial_shape()[0].get_length();
+        // When qq_bias is enabled and key_len > query_len, we need to use key_len for calculating block indices
+        const auto len_diff = static_cast<int64_t>(key_len) - static_cast<int64_t>(query_len);
+        const bool use_key_len_for_blocks = has_qq_bias && (len_diff > 0);
+
         mem_lock<int32_t, mem_lock_type::read> past_lens_mem_lock(past_lens_mem, stream);
         mem_lock<int32_t, mem_lock_type::read> subsequence_begins_mem_lock(subsequence_begins_mem, stream);
         std::unique_ptr<mem_lock<int32_t, mem_lock_type::write>> subsequence_offsets_lock = nullptr;
@@ -1849,6 +1944,12 @@ public:
                 }
             }
 
+            GPU_DEBUG_LOG << "[PA prepare_internal_buffers] MIXED stage buffer check: "
+                          << "intermediates_memories.size()=" << intermediates_memories.size()
+                          << ", sequential_gws_subseq_mapping_idx=" << sequential_gws_subseq_mapping_idx
+                          << ", has_scores_output=" << has_scores_output
+                          << ", use_micro_sdpa=" << use_micro_sdpa << std::endl;
+
             OPENVINO_ASSERT(intermediates_memories.size() > sequential_gws_subseq_mapping_idx,
                             "[GPU] Unexpected number of intermediates buffers for Paged Attention for mixed stage");
 
@@ -1860,23 +1961,53 @@ public:
             const auto memory_idx = 3;  // intermediate_idx for micro kernel
             auto& memory = intermediates_memories[memory_idx];
             micro_sdpa_block_starts_and_gws_mapping_lock.reset(new mem_lock<int32_t, mem_lock_type::write>(memory, stream));
+
+            GPU_DEBUG_LOG << "[PA prepare_internal_buffers] Micro SDPA buffer initialized, "
+                          << "buffer size=" << memory->size() << " bytes, "
+                          << "capacity=" << (memory->size() / sizeof(int32_t)) << " int32_t elements" << std::endl;
         }
 
         size_t index = 0;
         size_t micro_sdpa_index = 0;
         size_t subsequence_offsets_acc = 0;
         const auto pa_block_size = static_cast<int>(paged_attention::block_size);
+
+        GPU_DEBUG_LOG << "[PA prepare_internal_buffers] Starting block indices calculation, num_subsequences="
+                      << (subsequence_begins_mem_lock.size() - 1) << std::endl;
+
         for (size_t i = 0; i < subsequence_begins_mem_lock.size() - 1; i++) {
             const auto past_len = past_lens_mem_lock[i];
             const auto seq_start = subsequence_begins_mem_lock[i];
-            const auto seq_end = subsequence_begins_mem_lock[i + 1];
-            const auto seq_length = seq_end - seq_start;
+            const auto seq_end_query = subsequence_begins_mem_lock[i + 1];
+            const auto seq_length = seq_end_query - seq_start;
+
+            // When qq_bias is enabled and key_len > query_len, we need to account for the extra KV tokens
+            // In this case, the actual length to process should be key_len tokens per sequence
+            // For example: query_len=16, key_len=30 means we need to process 30 tokens
+            // The seq_length from subsequence_begins corresponds to query_len
+            // We need to adjust to use key_len when use_key_len_for_blocks is true
+            const int32_t effective_length = use_key_len_for_blocks ? static_cast<int32_t>(key_len) : seq_length;
+
+            // When qq_bias is enabled, adjust past_len for the starting position
+            // The cache write position should start from: past_len - (key_len - query_len)
+            const int32_t adjusted_past_len = use_key_len_for_blocks ? static_cast<int32_t>(past_len - len_diff) : past_len;
+
+            // Calculate the effective seq_end based on key_len when qq_bias is enabled
+            const int32_t seq_end = use_key_len_for_blocks ? (seq_start + effective_length) : seq_end_query;
+
+            GPU_DEBUG_LOG << "[PA prepare_internal_buffers] Subsequence " << i
+                          << ": past_len=" << past_len
+                          << ", adjusted_past_len=" << adjusted_past_len
+                          << ", seq_length=" << seq_length
+                          << ", effective_length=" << effective_length
+                          << ", seq_start=" << seq_start
+                          << ", seq_end=" << seq_end << std::endl;
 
             int32_t j = 0;
-            if (past_len != 0) {
+            if (adjusted_past_len != 0) {
                 auto block_start_pos = seq_start;
-                auto empty_slots = pa_block_size - (past_len % pa_block_size);
-                auto block_end_pos = seq_start + std::min(empty_slots, seq_length);
+                auto empty_slots = pa_block_size - (adjusted_past_len % pa_block_size);
+                auto block_end_pos = seq_start + std::min(empty_slots, effective_length);
 
                 blocks_indexes_start_lock[index] = block_start_pos;
                 blocks_indexes_end_lock[index] = block_end_pos;
@@ -1888,9 +2019,9 @@ public:
                 j += added_slots;
             }
 
-            for (; j < seq_length; j += pa_block_size) {
+            for (; j < effective_length; j += pa_block_size) {
                 auto block_start_pos = subsequence_begins_mem_lock[i] + j;
-                auto block_end_pos = std::min(block_start_pos + pa_block_size, seq_end);
+                auto block_end_pos = std::min(block_start_pos + pa_block_size, seq_start + effective_length);
 
                 blocks_indexes_start_lock[index] = block_start_pos;
                 blocks_indexes_end_lock[index] = block_end_pos;
@@ -1901,15 +2032,34 @@ public:
 
             if (micro_sdpa_block_starts_and_gws_mapping_lock) {
                 const auto block_size = static_cast<int>(query_block_size);
+                const auto buffer_capacity = micro_sdpa_block_starts_and_gws_mapping_lock->size();
+
+                GPU_DEBUG_LOG << "[PA prepare_internal_buffers] Micro SDPA subsequence " << i
+                              << " BEFORE: micro_sdpa_index=" << micro_sdpa_index
+                              << ", buffer_capacity=" << buffer_capacity
+                              << ", seq_length=" << seq_length
+                              << ", block_size=" << block_size << std::endl;
+
+                // Micro SDPA processes query blocks, not key blocks
+                // Query length is seq_length, even when key_len > query_len (qq_bias case)
                 for (int32_t j = 0; j < seq_length; j += block_size) {
+                    if (micro_sdpa_index + 1 >= buffer_capacity) {
+                        GPU_DEBUG_LOG << "[PA prepare_internal_buffers] ERROR: Micro SDPA buffer overflow! "
+                                      << "Trying to write at index " << micro_sdpa_index
+                                      << " but capacity is " << buffer_capacity << std::endl;
+                        break;
+                    }
                     auto block_start_pos = subsequence_begins_mem_lock[i] + j;
                     micro_sdpa_block_starts_and_gws_mapping_lock->operator[](micro_sdpa_index++) = block_start_pos;
                     micro_sdpa_block_starts_and_gws_mapping_lock->operator[](micro_sdpa_index++) = static_cast<int32_t>(i);
                 }
+                GPU_DEBUG_LOG << "[PA prepare_internal_buffers] Micro SDPA subsequence " << i
+                              << " AFTER: micro_sdpa_index=" << micro_sdpa_index
+                              << ", generated " << (seq_length / block_size + (seq_length % block_size ? 1 : 0)) << " query blocks" << std::endl;
             }
 
             if (stage == PagedAttentionStage::MIXED && !use_micro_sdpa) {
-                for (int32_t idx = seq_start; idx < seq_end; idx++) {
+                for (int32_t idx = seq_start; idx < seq_end_query; idx++) {
                     sequential_gws_subseq_mapping_lock->operator[](idx) = static_cast<int32_t>(i);
                 }
             }
@@ -1917,6 +2067,28 @@ public:
             if (subsequence_offsets_lock) {
                 subsequence_offsets_lock->operator[](i) = static_cast<int32_t>(subsequence_offsets_acc);
                 subsequence_offsets_acc += seq_length + past_len;
+            }
+        }
+
+        GPU_DEBUG_LOG << "[PA prepare_internal_buffers] Block indices calculation completed. "
+                      << "Total blocks generated: " << index
+                      << ", buffer capacity: " << blocks_indexes_start_lock.size() << std::endl;
+
+        if (index > blocks_indexes_start_lock.size()) {
+            GPU_DEBUG_LOG << "[PA prepare_internal_buffers] ERROR: Block indices overflow! "
+                          << "Generated " << index << " blocks but buffer only has capacity for "
+                          << blocks_indexes_start_lock.size() << std::endl;
+        }
+
+        if (use_micro_sdpa && micro_sdpa_block_starts_and_gws_mapping_lock) {
+            const auto buffer_capacity = micro_sdpa_block_starts_and_gws_mapping_lock->size();
+            GPU_DEBUG_LOG << "[PA prepare_internal_buffers] Micro SDPA buffer final check: "
+                          << "micro_sdpa_index=" << micro_sdpa_index
+                          << ", buffer_capacity=" << buffer_capacity << std::endl;
+
+            if (micro_sdpa_index > buffer_capacity) {
+                GPU_DEBUG_LOG << "[PA prepare_internal_buffers] ERROR: Micro SDPA buffer overflow! "
+                              << "Used " << micro_sdpa_index << " elements but capacity is " << buffer_capacity << std::endl;
             }
         }
     }

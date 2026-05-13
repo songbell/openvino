@@ -311,9 +311,16 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
 
         K += b0_kv * ADJUSTED_K_HEAD_SIZE * ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE;
         V += b0_kv * ADJUSTED_V_HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE;
-        Kc += subsequence_begin * ldkc
+
+        // In MIXED stage, Kc shape[0] is the input key token count
+        // For 2D layout [token_num, feature_num], BATCH_NUM is the first dimension (token count)
+        const uint kc_token_count = INPUT1_BATCH_NUM;  // Kc's batch/token dimension
+        const int len_diff = (int)kc_token_count - q;  // key_len - query_len
+        const uint kv_begin_offset = (len_diff > 0) ? len_diff : 0;
+
+        Kc += (subsequence_begin + kv_begin_offset) * ldkc
             + b0_kv * HEAD_SIZE + INPUT1_PAD_BEFORE_FEATURE_NUM;
-        Vc += subsequence_begin * ldvc
+        Vc += (subsequence_begin + kv_begin_offset) * ldvc
             + b0_kv * HEAD_SIZE + INPUT2_PAD_BEFORE_FEATURE_NUM;
     #endif
 #else

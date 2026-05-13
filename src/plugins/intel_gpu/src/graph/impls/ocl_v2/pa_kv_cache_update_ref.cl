@@ -545,14 +545,32 @@ KERNEL(pa_kv_cache_update)(
         const uint block_end_pos = blocked_indexes_end[block_idx];
         const uint tokens_num = block_end_pos - block_start_pos;
         const uint past_len = past_lens[subsequence_idx];
-        const uint token_start_pos_key = (past_len + block_start_pos - subsequence_begin_idx) % PAGED_ATTENTION_BLOCK_SIZE;
-        const uint token_start_pos_val = (past_len + block_start_pos - subsequence_begin_idx) % PAGED_ATTENTION_BLOCK_SIZE;
+
+        // Get query_len and key_len from shape info for prefill stage
+        // For data tensors, the first dimension (sequence length) is BATCH_NUM
+        #if defined(QUERY_INPUT_BATCH_NUM) && defined(INPUT0_BATCH_NUM)
+        const uint query_len = QUERY_INPUT_BATCH_NUM;
+        const uint key_len = INPUT0_BATCH_NUM;
+        #else
+        const uint query_len = 1;
+        const uint key_len = 1;
+        #endif
+
+        // Calculate the difference between key_len and query_len
+        const int len_diff = (int)key_len - (int)query_len;
+
+        // Adjust past_len if key_len > query_len
+        // The write position should start from: past_len - (key_len - query_len)
+        const uint adjusted_past_len = (len_diff > 0) ? (past_len - len_diff) : past_len;
+
+        const uint token_start_pos_key = (adjusted_past_len + block_start_pos - subsequence_begin_idx) % PAGED_ATTENTION_BLOCK_SIZE;
+        const uint token_start_pos_val = (adjusted_past_len + block_start_pos - subsequence_begin_idx) % PAGED_ATTENTION_BLOCK_SIZE;
 
         uint key_in_offset = INPUT0_OFFSET + block_start_pos * KEY_IN_STRIDE + head_idx * K_HEAD_SIZE;
 
         uint value_in_offset = INPUT1_OFFSET + block_start_pos * VAL_IN_STRIDE + head_idx * V_HEAD_SIZE;
 
-        const uint current_block_idx = (past_len + block_start_pos - subsequence_begin_idx) / PAGED_ATTENTION_BLOCK_SIZE;
+        const uint current_block_idx = (adjusted_past_len + block_start_pos - subsequence_begin_idx) / PAGED_ATTENTION_BLOCK_SIZE;
 
         const uint block_offset = block_indices_begins[subsequence_idx] + current_block_idx;
 

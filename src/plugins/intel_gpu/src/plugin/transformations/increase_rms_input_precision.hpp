@@ -22,5 +22,11 @@ public:
     IncreasePrecisionForQwenVLMerger();
 };
 
+class IncreasePrecisionForDraftModelHiddenNormRMS: public ov::pass::MatcherPass {
+public:
+    OPENVINO_MATCHER_PASS_RTTI("IncreasePrecisionForDraftModelHiddenNormRMS");
+    IncreasePrecisionForDraftModelHiddenNormRMS();
+};
+
 
 }   // namespace ov::intel_gpu
