@@ -73,30 +73,22 @@ CM_INLINE void Transpose_8x8(matrix_ref<T1, 8, 8> in, matrix_ref<T2, 8, 8> out) 
     }
 }
 
-// How multi-subsequence is supported in this kernel:
-// Because the single-token kernel often runs on a subset of sequences, not all sequences in the round.
-// Kernel metadata arrays (past_lens, subsequence_begins, block_indices_begins) are indexed by original sequence id.
-// The decode launch dimension is compact (batch_size = len(decode_seq_indices)), especially in mixed-route split.
-// selected_sequence_ids bridges compact decode batch index → original sequence index.
-// selected_sequence_count guards valid entries and avoids out-of-range threads.
+// How small-q decode is supported in this kernel:
+// Each selected (subsequence, q-token) pair becomes one entry on GWS[0]. The
+// host packs them into selected_q_mapping as i32 pairs so the kernel can index
+// directly without any divide/modulo:
 //
-// selected_sequence_ids:
-// Host-selected subsequence IDs for this launch (compact decode subset).
-// Each entry indexes global sequence metadata arrays:
-//   past_lens / block_indices_begins / subsequence_begins.
-// Workgroup seq_idx (cm_global_id(0)) maps through this array to get
-// the original sequence index (orig_seq_idx).
+//   selected_q_mapping[2*i + 0] = orig_seq_idx
+//   selected_q_mapping[2*i + 1] = q_in_subseq        // 0..(q_len_for_subseq-1)
+//   selected_token_count        = total entries
 //
-// Host preparation rules:
-// 1) Fill selected_sequence_ids with sequence IDs to run in this kernel.
-// 2) Keep order aligned with the compact output row order for this launch.
-// 3) Ensure every ID is in [0, total_sequence_count), and unique for decode.
-// 4) For this single-token path, each selected sequence must have exactly
-//    one query token in the current round (num_tokens == 1).
+// q_len = 1 callers (pure decode) fill q_in_subseq = 0 — kernel behaviour is
+// identical to the legacy "last token of each subsequence" path. q_len > 1
+// (spec-decoding) callers fan out one entry per spec token.
 //
-// selected_sequence_count:
-// - Number of valid entries in selected_sequence_ids.
-// - Bounds guard in kernel: seq_idx >= selected_sequence_count => return.
+// Causal cap is per q-token: this q-token sees `past_lens + q_in_subseq + 1`
+// keys. Optional qq_bias tree mask (HAS_QQ_BIAS jit) zeroes the spec-window
+// (key, query) pairs flagged by qq_bias[query_spec, key_spec] == 0.
 extern "C" _GENX_MAIN_ void KERNEL_NAME(
     half* query [[type("svmptr_t")]],
     KV_ELEMENT_TYPE* key [[type("svmptr_t")]],
@@ -105,11 +97,15 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
     int* block_indices [[type("svmptr_t")]],
     int* block_indices_begins [[type("svmptr_t")]],
     int* subsequence_begins [[type("svmptr_t")]],
-    int* selected_sequence_ids [[type("svmptr_t")]],
+    int* selected_q_mapping [[type("svmptr_t")]],
     float* output [[type("svmptr_t")]],
     float* lse [[type("svmptr_t")]],
-    int q_len,// 1
-    int selected_sequence_count
+#if HAS_QQ_BIAS
+    uchar* qq_bias [[type("svmptr_t")]],
+    int* qq_bias_begins [[type("svmptr_t")]],
+#endif
+    int q_len_unused,
+    int selected_token_count
     ) {
     //# batch=1, seq_num=1 or >1
     //# query [seq_idx, seq_num, head_num, head_size]
@@ -146,11 +142,22 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
 
     //# Each WG processes a partition, which is KV_PARTITION_SIZE long and multiple of KV_BLOCK_SIZE.
     //# KV_BLOCK_SIZE can be 32/64/128/256, etc.
-    const uint seq_idx = cm_global_id(0);
-    if (seq_idx >= selected_sequence_count) {
+    const uint sel_idx = cm_global_id(0);
+    if (sel_idx >= (uint)selected_token_count) {
         return;
     }
-    const uint orig_seq_idx = selected_sequence_ids[seq_idx];
+    const uint orig_seq_idx = (uint)selected_q_mapping[sel_idx * 2 + 0];
+    const uint q_in_subseq  = (uint)selected_q_mapping[sel_idx * 2 + 1];
+
+#if HAS_QQ_BIAS
+    // qq_num / spec_num depend only on orig_seq_idx; hoist out of the per-key
+    // mask loop so the integer-sqrt search runs once per thread instead of
+    // being re-derived alongside per-partition geometry below.
+    const int qq_num = qq_bias_begins[orig_seq_idx + 1] - qq_bias_begins[orig_seq_idx];
+    int spec_num = 0;
+    while ((spec_num + 1) * (spec_num + 1) <= qq_num) ++spec_num;
+#endif
+
     const uint kv_head_num_idx = cm_global_id(1) / Q_head_chunks_per_kv_head;
     const uint head_num_idx = cm_global_id(1) * Q_head_chunk_size;
     //# KV_PARTITION_SIZE --> EU thread
@@ -159,17 +166,22 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
     const uint kv_partition_idx = cm_group_id(2);
 
     const int subseq_q_begin_i = subsequence_begins[orig_seq_idx];
-    const int subseq_q_end_i = subsequence_begins[orig_seq_idx + 1];
+    const int subseq_q_end_i   = subsequence_begins[orig_seq_idx + 1];
     if (subseq_q_end_i <= subseq_q_begin_i) {
         return;
     }
     const uint subseq_q_begin = (uint)subseq_q_begin_i;
-    const uint subseq_q_end = (uint)subseq_q_end_i;
-    const uint subseq_q_len = (uint)(subseq_q_end_i - subseq_q_begin_i);
+    const uint subseq_q_end   = (uint)subseq_q_end_i;
 
-    // Single-token path uses the latest token from each subsequence.
-    const uint q_token_idx = subseq_q_end - 1;
-    const uint kv_len = past_lens[orig_seq_idx] + subseq_q_len;
+    // Per-q-token causal cap: this q-token sees `past + q_in_subseq + 1` keys.
+    // q_len = 1 callers pass q_in_subseq = 0 → kv_len = past + 1, matching the
+    // legacy "last token of each subsequence" semantics.
+    const uint q_token_idx = subseq_q_begin + q_in_subseq;
+    if (q_token_idx >= subseq_q_end) {
+        return;
+    }
+    const uint past_q_lens = (uint)past_lens[orig_seq_idx];
+    const uint kv_len      = past_q_lens + q_in_subseq + 1;
     const uint seq_kv_partition_num = (kv_len + KV_PARTITION_SIZE - 1) / KV_PARTITION_SIZE;
 
     const uint block_begin = block_indices_begins[orig_seq_idx];
@@ -186,13 +198,13 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
         #pragma unroll
         for (int qi = 0; qi < Q_head_chunk_size; qi++) {
             matrix<float, REG_M, REG_N> zero = 0.0f;
-            uint o_offset = seq_idx * kv_partition_num * HEADS_NUM * HEAD_SIZE + kv_partition_num * (head_num_idx + qi) * HEAD_SIZE + wg_thread_id * HEAD_SIZE;
+            uint o_offset = sel_idx * kv_partition_num * HEADS_NUM * HEAD_SIZE + kv_partition_num * (head_num_idx + qi) * HEAD_SIZE + wg_thread_id * HEAD_SIZE;
             #pragma unroll
             for (int k = 0; k < HEAD_SIZE; k += REG_N) {
                 cm_svm_block_write<float, REG_N>((svmptr_t)(output + o_offset + k), zero.format<float>());
             }
 
-            uint lse_offset = seq_idx * HEADS_NUM * kv_partition_num + (head_num_idx + qi) * kv_partition_num + wg_thread_id;
+            uint lse_offset = sel_idx * HEADS_NUM * kv_partition_num + (head_num_idx + qi) * kv_partition_num + wg_thread_id;
             lse[lse_offset] = -3e38f;
         }
         return;
@@ -449,6 +461,37 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
         }
     }
 
+#if HAS_QQ_BIAS
+    // Speculative tree mask. query_spec for this SG is the constant q_in_subseq.
+    // qq_bias layout: u8 row-major [spec_num, spec_num], 0 = masked.
+    // The spec window covers exactly `spec_num` K positions starting at past_q_lens.
+    // Most partitions don't overlap the window, so the geometry guard below skips
+    // all per-K work for them.
+    if (qq_num > 0) {
+        const int query_spec = (int)q_in_subseq;
+        const int kv_global_start = (int)(kv_partition_idx * KV_PARTITION_SIZE);
+        const int kv_global_end   = kv_global_start + (int)KV_PARTITION_SIZE;
+        const int spec_global_lo  = (int)past_q_lens;
+        const int spec_global_hi  = spec_global_lo + spec_num;
+        if (query_spec < spec_num &&
+            kv_global_start < spec_global_hi &&
+            spec_global_lo  < kv_global_end) {
+            const uchar* mask_row = qq_bias + qq_bias_begins[orig_seq_idx] + query_spec * spec_num;
+            const int overlap_lo = spec_global_lo > kv_global_start ? spec_global_lo : kv_global_start;
+            const int overlap_hi = spec_global_hi < kv_global_end  ? spec_global_hi : kv_global_end;
+            for (int key_global = overlap_lo; key_global < overlap_hi; ++key_global) {
+                const int key_spec = key_global - spec_global_lo;
+                const int kv_local = key_global - kv_global_start;
+                if (mask_row[key_spec] == 0) {
+                    // qq_bias is per (query, key) — head-invariant. Mask the same
+                    // kv_local column across every Q-head row of rS in one shot.
+                    rS.select<Q_head_chunk_size, 1, 1, 1>(0, kv_local) = -3.4e38f;
+                }
+            }
+        }
+    }
+#endif
+
     // online softmax
     vector<float, Q_head_chunk_size> cur_sum = 0.0f;
     vector<float, Q_head_chunk_size> cur_lse = 0.0f;
@@ -698,7 +741,7 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
     #pragma unroll
     for (int qi = 0; qi < Q_head_chunk_size; qi++) {
         matrix<float, REG_M, REG_N> cur_O_f32;
-        uint o_offset = seq_idx * kv_partition_num * HEADS_NUM * HEAD_SIZE + kv_partition_num * (head_num_idx + qi) * HEAD_SIZE + wg_thread_id * HEAD_SIZE;
+        uint o_offset = sel_idx * kv_partition_num * HEADS_NUM * HEAD_SIZE + kv_partition_num * (head_num_idx + qi) * HEAD_SIZE + wg_thread_id * HEAD_SIZE;
         float div_cur_sum = 1.0/cur_sum[qi];
         auto Omat_slice = Omat[qi].format<float, HEAD_SIZE/REG_N * REG_M, REG_N>();
         #pragma unroll
@@ -711,7 +754,7 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
             #endif
             cm_svm_block_write<float, REG_N>((svmptr_t)(output + o_offset + k), cur_O_f32.format<float>());
         }
-        uint lse_offset = seq_idx * HEADS_NUM * kv_partition_num + (head_num_idx + qi) * kv_partition_num + wg_thread_id;
+        uint lse_offset = sel_idx * HEADS_NUM * kv_partition_num + (head_num_idx + qi) * kv_partition_num + wg_thread_id;
         lse[lse_offset] = cur_lse[qi];
     }
 }

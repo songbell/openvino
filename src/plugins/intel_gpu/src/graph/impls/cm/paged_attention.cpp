@@ -10,8 +10,6 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
-#include <numeric>
-#include <optional>
 #include <utility>
 #include <vector>
 
@@ -81,8 +79,6 @@ public:
     Stage::Ptr kv_cache_update = make_stage<PagedAttentionGeneratorKVCacheUpdate>();
     Stage::Ptr pa_single_token = make_stage<PagedAttentionGeneratorSingleToken>();
     Stage::Ptr pa_single_token_finalization = make_stage<PagedAttentionGeneratorSingleTokenFinalization>();
-    Stage::Ptr pa_small_q = make_stage<PagedAttentionGeneratorSmallQ>();
-    Stage::Ptr pa_small_q_finalization = make_stage<PagedAttentionGeneratorSmallQFinalization>();
     Stage::Ptr pa_multi_token_1 = make_stage<PagedAttentionGeneratorMultiToken>(1);
     Stage::Ptr pa_multi_token_128 = make_stage<PagedAttentionGeneratorMultiToken>(128);
     Stage::Ptr pa_multi_token_256 = make_stage<PagedAttentionGeneratorMultiToken>(256);
@@ -109,8 +105,6 @@ public:
         add_stage(kv_cache_update, params);
         add_stage(pa_single_token, params);
         add_stage(pa_single_token_finalization, params);
-        add_stage(pa_small_q, params);
-        add_stage(pa_small_q_finalization, params);
         add_stage(pa_multi_token_1, params);
         if (desc->has_xattention) {
             add_stage(pa_multi_token_128, params);
@@ -260,8 +254,6 @@ public:
         rt_params->batch_size_in_sequences = get_batch_size_in_sequences(params.input_layouts);
         rt_params->single_token_selected_count = 0;
         rt_params->multi_token_wg_count = 0;
-        rt_params->small_q_token_count = 0;
-        rt_params->small_q_max_kv_len = 0;
         rt_params->enable_xattn_estimation = false;
 
         rt_params->stage = get_paged_attention_stage(params);
@@ -289,16 +281,13 @@ public:
 
                 if (use_split_mixed) {
                     const auto past_len = static_cast<size_t>(std::max<int32_t>(past_lens[subsequence_id], 0));
-                    const bool decode_subsequence = (q_len == 1) && (past_len > 0);
-                    // Small-q route: spec-decoding subsequences with q_len in (1, SMALL_Q_THRESHOLD]
-                    // and a non-empty past keep all tokens in pa_small_q. Each (subseq, q-token)
-                    // pair becomes one entry in the small_q_token_count map.
-                    const bool small_q_subsequence = (q_len > 1) && (q_len <= SMALL_Q_THRESHOLD) && (past_len > 0);
-                    if (decode_subsequence) {
-                        rt_params->single_token_selected_count++;
-                    } else if (small_q_subsequence) {
-                        rt_params->small_q_token_count += q_len;
-                        rt_params->small_q_max_kv_len = std::max(rt_params->small_q_max_kv_len, past_len + q_len);
+                    // Route q_len <= SMALL_Q_THRESHOLD with non-empty past to pa_single_token.
+                    // q_len = 1 is the legacy decode case (one token per subseq); 1 < q_len <= SMALL_Q_THRESHOLD
+                    // can be the spec-decoding case where each q-token becomes one (subseq, q_in_subseq)
+                    // entry on GWS[0]. q_len > SMALL_Q_THRESHOLD still falls through to pa_multi_token.
+                    const bool route_to_single_token = (q_len <= SMALL_Q_THRESHOLD) && (past_len > 0);
+                    if (route_to_single_token) {
+                        rt_params->single_token_selected_count += q_len;
                     } else {
                         rt_params->multi_token_wg_count += ceil_div(q_len, wg_seq_len);
                     }
@@ -307,7 +296,7 @@ public:
                 }
             }
 
-            if (use_split_mixed && (rt_params->single_token_selected_count > 0 || rt_params->small_q_token_count > 0)) {
+            if (use_split_mixed && rt_params->single_token_selected_count > 0) {
                 const auto partition_size = PagedAttentionGeneratorSingleToken::get_partition_size(desc->has_xattention);
                 rt_params->num_of_partitions = ceil_div(max_context_len, partition_size);
                 rt_params->q_chunking = get_single_token_q_chunking(params, *desc, partition_size);
@@ -374,16 +363,24 @@ public:
         OPENVINO_ASSERT(rt_params->stage == PagedAttentionStage::GENERATE, "prepare_single_token_selected_ids is expected only for generate/decode stage");
         auto& stream = instance.get_network().get_stream();
 
-        auto selected_ids_mem = instance.get_intermediates_memories()[PagedAttentionInternBuffIdx::SINGLE_TOKEN_SELECTED_SEQ_IDS];
+        auto mapping_mem = instance.get_intermediates_memories()[PagedAttentionInternBuffIdx::SINGLE_TOKEN_SELECTED_Q_MAPPING];
 
-        mem_lock<int32_t, mem_lock_type::write> selected_ids_lock(selected_ids_mem, stream);
-        const size_t selected_capacity = selected_ids_mem->count();
-        OPENVINO_ASSERT(selected_capacity >= rt_params->batch_size_in_sequences,
-                        "Insufficient single-token selected ids buffer size: expected at least ",
-                        rt_params->batch_size_in_sequences,
+        // GENERATE stage has q_len = 1 for every selected subsequence. Pack
+        // (orig_seq_idx, q_in_subseq=0) so the kernel reads the same i32-pair layout
+        // shared with the small-q (1 < q_len <= 16) split-mixed path.
+        const size_t expected_pairs = rt_params->batch_size_in_sequences * 2;
+        const size_t mapping_capacity = mapping_mem->count();
+        OPENVINO_ASSERT(mapping_capacity >= expected_pairs,
+                        "Insufficient single-token mapping buffer size: expected at least ",
+                        expected_pairs,
                         ", got ",
-                        selected_capacity);
-        std::iota(selected_ids_lock.begin(), selected_ids_lock.begin() + static_cast<std::ptrdiff_t>(rt_params->batch_size_in_sequences), 0);
+                        mapping_capacity);
+
+        mem_lock<int32_t, mem_lock_type::write> mapping_lock(mapping_mem, stream);
+        for (size_t i = 0; i < rt_params->batch_size_in_sequences; ++i) {
+            mapping_lock[i * 2 + 0] = static_cast<int32_t>(i);  // orig_seq_idx
+            mapping_lock[i * 2 + 1] = 0;                         // q_in_subseq = 0
+        }
 
         rt_params->single_token_selected_count = rt_params->batch_size_in_sequences;
     }
@@ -400,39 +397,28 @@ public:
         const auto subsequence_begins = read_i32_input(params, PagedAttentionInputIdx::SUBSEQUENCE_BEGINS);
         const auto past_lens = read_i32_input(params, PagedAttentionInputIdx::PAST_LENS);
 
-        auto selected_ids_mem = instance.get_intermediates_memories()[PagedAttentionInternBuffIdx::SINGLE_TOKEN_SELECTED_SEQ_IDS];
-        auto mapping_mem = instance.get_intermediates_memories()[PagedAttentionInternBuffIdx::MULTI_TOKEN_WG_MAPPING];
-        mem_lock<int32_t, mem_lock_type::write> selected_ids_lock(selected_ids_mem, stream);
-        mem_lock<int32_t, mem_lock_type::write> mapping_lock(mapping_mem, stream);
+        auto single_token_mapping_mem = instance.get_intermediates_memories()[PagedAttentionInternBuffIdx::SINGLE_TOKEN_SELECTED_Q_MAPPING];
+        auto multi_token_mapping_mem  = instance.get_intermediates_memories()[PagedAttentionInternBuffIdx::MULTI_TOKEN_WG_MAPPING];
+        mem_lock<int32_t, mem_lock_type::write> single_token_lock(single_token_mapping_mem, stream);
+        mem_lock<int32_t, mem_lock_type::write> multi_token_lock(multi_token_mapping_mem, stream);
 
-        const size_t selected_capacity = selected_ids_mem->count();
-        const size_t expected_mapping_size = rt_params->multi_token_wg_count * 2;
-        OPENVINO_ASSERT(mapping_mem->count() >= expected_mapping_size,
-                        "Insufficient multi-token mapping buffer size: expected at least ",
-                        expected_mapping_size,
+        const size_t single_token_capacity = single_token_mapping_mem->count();
+        const size_t expected_single_token_pairs = rt_params->single_token_selected_count * 2;
+        const size_t expected_multi_token_size = rt_params->multi_token_wg_count * 2;
+        OPENVINO_ASSERT(single_token_capacity >= expected_single_token_pairs,
+                        "Insufficient single-token mapping buffer size: expected at least ",
+                        expected_single_token_pairs,
                         ", got ",
-                        mapping_mem->count());
-
-        // Small-q mapping: pairs (orig_seq_idx, q_in_subseq), one entry per token.
-        const bool has_small_q = rt_params->small_q_token_count > 0;
-        std::optional<mem_lock<int32_t, mem_lock_type::write>> small_q_lock;
-        size_t small_q_capacity = 0;
-        size_t small_q_idx = 0;
-        const size_t expected_small_q_size = rt_params->small_q_token_count * 2;
-        if (has_small_q) {
-            auto small_q_mem = instance.get_intermediates_memories()[PagedAttentionInternBuffIdx::SMALL_Q_SELECTED_MAPPING];
-            small_q_capacity = small_q_mem->count();
-            OPENVINO_ASSERT(small_q_capacity >= expected_small_q_size,
-                            "Insufficient small-q mapping buffer size: expected at least ",
-                            expected_small_q_size,
-                            ", got ",
-                            small_q_capacity);
-            small_q_lock.emplace(small_q_mem, stream);
-        }
+                        single_token_capacity);
+        OPENVINO_ASSERT(multi_token_mapping_mem->count() >= expected_multi_token_size,
+                        "Insufficient multi-token mapping buffer size: expected at least ",
+                        expected_multi_token_size,
+                        ", got ",
+                        multi_token_mapping_mem->count());
 
         const int32_t wg_seq_len = static_cast<int32_t>(PagedAttentionGeneratorMultiToken::get_wg_seq_len(params));
-        size_t selected_count = 0;
-        size_t mapping_idx = 0;
+        size_t single_token_idx = 0;
+        size_t multi_token_idx = 0;
 
         for (size_t sequence_id = 0; sequence_id + 1 < subsequence_begins.size(); ++sequence_id) {
             const int32_t q_begin = subsequence_begins[sequence_id];
@@ -443,57 +429,45 @@ public:
 
             const int32_t q_len = q_end - q_begin;
             const int32_t past_len = std::max<int32_t>(past_lens[sequence_id], 0);
-            const bool decode_subsequence = (q_len == 1) && (past_len > 0);
-            const bool small_q_subsequence = (q_len > 1) && (q_len <= static_cast<int32_t>(SMALL_Q_THRESHOLD)) && (past_len > 0);
+            // Route q_len <= SMALL_Q_THRESHOLD with non-empty past to pa_single_token.
+            // q_len = 1 (decode) and 1 < q_len <= 16 (spec-decoding) share the same i32-pair
+            // mapping layout — q_in_subseq = 0..(q_len-1).
+            const bool route_to_single_token = (q_len <= static_cast<int32_t>(SMALL_Q_THRESHOLD)) && (past_len > 0);
 
-            if (decode_subsequence) {
-                OPENVINO_ASSERT(selected_count < selected_capacity,
-                                "Single-token selected ids write out of bounds: idx=",
-                                selected_count,
-                                ", capacity=",
-                                selected_capacity);
-                selected_ids_lock[selected_count++] = static_cast<int32_t>(sequence_id);
-                continue;
-            }
-
-            if (small_q_subsequence) {
-                OPENVINO_ASSERT(small_q_lock.has_value(), "Small-q mapping buffer not locked but a small-q subsequence was found");
+            if (route_to_single_token) {
                 for (int32_t qi = 0; qi < q_len; ++qi) {
-                    OPENVINO_ASSERT(small_q_idx + 1 < small_q_capacity,
-                                    "Small-q mapping write out of bounds: idx=",
-                                    small_q_idx,
+                    OPENVINO_ASSERT(single_token_idx + 1 < single_token_capacity,
+                                    "Single-token mapping write out of bounds: idx=",
+                                    single_token_idx,
                                     ", capacity=",
-                                    small_q_capacity);
-                    (*small_q_lock)[small_q_idx++] = static_cast<int32_t>(sequence_id);
-                    (*small_q_lock)[small_q_idx++] = qi;
+                                    single_token_capacity);
+                    single_token_lock[single_token_idx++] = static_cast<int32_t>(sequence_id);
+                    single_token_lock[single_token_idx++] = qi;
                 }
                 continue;
             }
 
             for (int32_t block_start = q_begin; block_start < q_end; block_start += wg_seq_len) {
-                OPENVINO_ASSERT(mapping_idx + 1 < expected_mapping_size,
+                OPENVINO_ASSERT(multi_token_idx + 1 < expected_multi_token_size,
                                 "Multi-token mapping write out of bounds: idx=",
-                                mapping_idx,
+                                multi_token_idx,
                                 ", expected_size=",
-                                expected_mapping_size);
-                mapping_lock[mapping_idx++] = block_start;
-                mapping_lock[mapping_idx++] = static_cast<int32_t>(sequence_id);
+                                expected_multi_token_size);
+                multi_token_lock[multi_token_idx++] = block_start;
+                multi_token_lock[multi_token_idx++] = static_cast<int32_t>(sequence_id);
             }
         }
 
-        OPENVINO_ASSERT(selected_count == rt_params->single_token_selected_count,
-                        "Unexpected selected ids count in split mixed mode: expected ",
-                        rt_params->single_token_selected_count,
+        OPENVINO_ASSERT(single_token_idx == expected_single_token_pairs,
+                        "Unexpected single-token mapping size: expected ",
+                        expected_single_token_pairs,
                         ", got ",
-                        selected_count);
-        OPENVINO_ASSERT(mapping_idx == expected_mapping_size, "Unexpected multi-token mapping size: expected ", expected_mapping_size, ", got ", mapping_idx);
-        OPENVINO_ASSERT(small_q_idx == expected_small_q_size,
-                        "Unexpected small-q mapping size: expected ",
-                        expected_small_q_size,
+                        single_token_idx);
+        OPENVINO_ASSERT(multi_token_idx == expected_multi_token_size,
+                        "Unexpected multi-token mapping size: expected ",
+                        expected_multi_token_size,
                         ", got ",
-                        small_q_idx);
-
-        rt_params->single_token_selected_count = selected_count;
+                        multi_token_idx);
     }
 
     void prepare_xattn_metadata(primitive_inst& instance) {
@@ -601,10 +575,6 @@ public:
                     res_event = {execute_stage(res_event, instance, pa_single_token)};
                     res_event = {execute_stage(res_event, instance, pa_single_token_finalization)};
                 }
-                if (rt_params->small_q_token_count > 0) {
-                    res_event = {execute_stage(res_event, instance, pa_small_q)};
-                    res_event = {execute_stage(res_event, instance, pa_small_q_finalization)};
-                }
                 execute_multi_token_path();
             } else {
                 prepare_multi_token_mapping(instance);
@@ -651,10 +621,9 @@ public:
             internal_buffers.emplace_back(tmp_out_elements_count, ov::element::f32);  // 0: intermediate partition output
             internal_buffers.emplace_back(buf_elements_count, ov::element::f32);      // 1: softmax exp_sums
             internal_buffers.emplace_back(2, ov::element::i32, true, false);          // 2: unused multi-token mapping placeholder (lockable, not shareable)
-            internal_buffers.emplace_back(total_tokens,
-                                          ov::element::i32,
-                                          true,
-                                          false);  // 3: selected sequence ids (lockable for mem_lock<write>, not shareable)
+            // 3: SINGLE_TOKEN_SELECTED_Q_MAPPING — i32 pairs (orig_seq_idx, q_in_subseq).
+            //    GENERATE always has q_len = 1; q_in_subseq = 0 for every entry.
+            internal_buffers.emplace_back(static_cast<int64_t>(total_tokens * 2), ov::element::i32, true, false);
 
             GPU_DEBUG_TRACE_DETAIL << "  internal buffer sizes: tmp_out=" << tmp_out_elements_count * 4 << "  exp_sums=" << buf_elements_count * 4 << std::endl;
         } else {
@@ -662,8 +631,6 @@ public:
             int64_t decode_buf_elements_count = 16;
             const bool needs_single_token_buffers =
                 stage == PagedAttentionStage::MIXED && m_mixed_route_mode == MixedRouteMode::SPLIT && rt_params->single_token_selected_count > 0;
-            const bool needs_small_q_buffers =
-                stage == PagedAttentionStage::MIXED && m_mixed_route_mode == MixedRouteMode::SPLIT && rt_params->small_q_token_count > 0;
             if (needs_single_token_buffers) {
                 OPENVINO_ASSERT(rt_params->num_of_partitions != 0);
                 decode_buf_elements_count = static_cast<int64_t>(rt_params->single_token_selected_count * desc->heads_num * rt_params->num_of_partitions);
@@ -671,16 +638,17 @@ public:
                     static_cast<int64_t>(rt_params->single_token_selected_count * desc->heads_num * desc->v_head_size * rt_params->num_of_partitions);
             }
 
-            internal_buffers.emplace_back(decode_tmp_out_elements_count, ov::element::f32);  // 0: intermediate partition output
-            internal_buffers.emplace_back(decode_buf_elements_count, ov::element::f32);      // 1: softmax exp_sums
+            internal_buffers.emplace_back(decode_tmp_out_elements_count, ov::element::f32);  // 0: DECODE_PARTITIONOUT (sized by token count for q_len >= 1)
+            internal_buffers.emplace_back(decode_buf_elements_count, ov::element::f32);      // 1: DECODE_EXPSUMS (lse) sized by token count
             internal_buffers.emplace_back(std::max<int64_t>(2, static_cast<int64_t>(rt_params->multi_token_wg_count * 2)),
                                           ov::element::i32,
                                           true,
-                                          false);  // 2: multi-token mapping (lockable for mem_lock<write>, not shareable)
-            internal_buffers.emplace_back(std::max<int64_t>(1, static_cast<int64_t>(rt_params->batch_size_in_sequences)),
+                                          false);  // 2: MULTI_TOKEN_WG_MAPPING (lockable for mem_lock<write>, not shareable)
+            // 3: SINGLE_TOKEN_SELECTED_Q_MAPPING — i32 pairs (orig_seq_idx, q_in_subseq), one per routed token.
+            internal_buffers.emplace_back(std::max<int64_t>(2, static_cast<int64_t>(rt_params->single_token_selected_count * 2)),
                                           ov::element::i32,
                                           true,
-                                          false);  // 3: selected ids (lockable for mem_lock<write>, not shareable)
+                                          false);
 
             // internal buffer for XAttention (cumulative sizes across all subsequences)
             if (rt_params->enable_xattn_estimation) {
@@ -724,30 +692,7 @@ public:
                                        << "  count_elements_mask_merged=" << count_elements_mask_merged << "  count_meta_int32s=" << count_meta_int32s
                                        << "  count_find_map_int32s=" << count_find_map_int32s << "  count_post_map_int32s=" << count_post_map_int32s
                                        << std::endl;
-            } else {
-                // Pad slots 4..10 (or 4..11 with FIND_DEBUG_ACC) so SMALL_Q_* enum indices remain valid.
-                const size_t pad_to_index = static_cast<size_t>(PagedAttentionInternBuffIdx::SMALL_Q_PARTITIONOUT);
-                while (internal_buffers.size() < pad_to_index) {
-                    internal_buffers.emplace_back(1, ov::element::i32, true, false);
-                }
             }
-
-            // Small-q decode scratch buffers. Always emitted in MIXED so the small-q stage
-            // can be added unconditionally; sized to 1 when not used to avoid wasted memory.
-            int64_t small_q_tmp_out_elems = 16;
-            int64_t small_q_buf_elems = 16;
-            int64_t small_q_mapping_elems = 2;
-            if (needs_small_q_buffers) {
-                OPENVINO_ASSERT(rt_params->num_of_partitions != 0);
-                small_q_buf_elems =
-                    static_cast<int64_t>(rt_params->small_q_token_count * desc->heads_num * rt_params->num_of_partitions);
-                small_q_tmp_out_elems = static_cast<int64_t>(rt_params->small_q_token_count * desc->heads_num *
-                                                              desc->v_head_size * rt_params->num_of_partitions);
-                small_q_mapping_elems = static_cast<int64_t>(rt_params->small_q_token_count * 2);
-            }
-            internal_buffers.emplace_back(small_q_tmp_out_elems, ov::element::f32);                       // SMALL_Q_PARTITIONOUT
-            internal_buffers.emplace_back(small_q_buf_elems, ov::element::f32);                           // SMALL_Q_EXPSUMS
-            internal_buffers.emplace_back(small_q_mapping_elems, ov::element::i32, true, false);          // SMALL_Q_SELECTED_MAPPING
         }
 
         return internal_buffers;

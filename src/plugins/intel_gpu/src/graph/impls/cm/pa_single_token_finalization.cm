@@ -14,28 +14,36 @@
  * limitations under the License.
  *******************************************************************************/
 
-//cm_sdpa_2nd_reduce
+// cm_sdpa_2nd_reduce
+//
+// Cross-partition logsumexp reduce indexed by the packed (subseq, q-token)
+// selection produced by pa_single_token. selected_q_mapping is i32 pairs
+// [orig_seq_idx, q_in_subseq]; q_len = 1 callers fill q_in_subseq = 0 so the
+// output position becomes subseq_q_begin (= subseq_q_end - 1, identical to
+// the legacy "last token of each subsequence" path).
 extern "C" _GENX_MAIN_ void KERNEL_NAME(
     float* input [[type("svmptr_t")]],
     half* output [[type("svmptr_t")]],
     float* lse [[type("svmptr_t")]],
     int* subsequence_begins [[type("svmptr_t")]],
-    int* selected_sequence_ids [[type("svmptr_t")]],
-    int selected_sequence_count,
+    int* selected_q_mapping [[type("svmptr_t")]],
+    int selected_token_count,
     int kv_partition_num
     ) {
-        auto batch = cm_global_id(0);
-        if (batch >= selected_sequence_count) {
+        auto sel_idx = cm_global_id(0);
+        if (sel_idx >= (uint)selected_token_count) {
             return;
         }
-        auto orig_batch = selected_sequence_ids[batch];
+        const uint orig_seq_idx = (uint)selected_q_mapping[sel_idx * 2 + 0];
+        const uint q_in_subseq  = (uint)selected_q_mapping[sel_idx * 2 + 1];
+
         auto head = cm_global_id(1);
         auto offset = cm_group_id(2) * REDUCE_SPLIT_SIZE;
         const int total_partition_num = (kv_partition_num * HEADS_NUM);
 
-        // load lse
+        // Logsumexp across partitions for this (sel_idx, head).
         float total_lse = 0.0;
-        uint lse_offset = batch * total_partition_num + head * kv_partition_num;
+        uint lse_offset = sel_idx * total_partition_num + head * kv_partition_num;
         constexpr float log2e = 1.4426950408889634f;
         float* lse_vec = lse + lse_offset;
         float lse_max = lse_vec[0];
@@ -60,7 +68,7 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
         matrix<half, 1, REDUCE_SPLIT_SIZE> out_mat = 0;
         matrix<float, 1, REDUCE_SPLIT_SIZE> out_mat_f32 = 0;
         matrix<float, 1, REDUCE_SPLIT_SIZE> data_mat;
-        uint input_offset = batch * total_partition_num * HEAD_SIZE + head * kv_partition_num * HEAD_SIZE + offset;
+        uint input_offset = sel_idx * total_partition_num * HEAD_SIZE + head * kv_partition_num * HEAD_SIZE + offset;
 
         for(int k = 0; k < iter * 16; k += 16) {
             #pragma unroll
@@ -80,12 +88,12 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
 
         out_mat = cm_mul<half>(out_mat_f32, (float)1.0f);
         // write output
-        uint q_begin = subsequence_begins[orig_batch];
-        uint q_end = subsequence_begins[orig_batch + 1];
+        uint q_begin = subsequence_begins[orig_seq_idx];
+        uint q_end   = subsequence_begins[orig_seq_idx + 1];
         if (q_end <= q_begin) {
             return;
         }
-        uint q_token_idx = q_end - 1;
+        uint q_token_idx = q_begin + q_in_subseq;
         uint output_offset = q_token_idx * HEADS_NUM * HEAD_SIZE + head * HEAD_SIZE + offset;
         cm_svm_block_write<half, REDUCE_SPLIT_SIZE>((svmptr_t)(output + output_offset), out_mat.format<half>());
     }
