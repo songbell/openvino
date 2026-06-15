@@ -2935,6 +2935,16 @@ TEST_P(qq_bias_test, basic) {
     execute(p);
 }
 
+// Perf-oriented fixture for the CM small-q (1 < q_len <= SMALL_Q_THRESHOLD) route.
+class small_q_test : public PagedAttentionTest<paged_attention_test_params> {};
+TEST_P(small_q_test, basic) {
+    auto p = GetParam();
+    if (!check_cm_available())
+        GTEST_SKIP() << "CM JIT support is required for small-q perf tests";
+
+    execute(p, p.run_reference);
+}
+
 const auto ENABLE_CACHE_COMPRESSION = true;
 const auto DISABLE_CACHE_COMPRESSION = false;
 const auto DISABLE_SCORES = ScoresMode::DISABLED;
@@ -3500,6 +3510,65 @@ INSTANTIATE_TEST_SUITE_P(DISABLED_smoke_paged_attention_perf_cm, xattention_test
 
     // mixed prefill+generate
     disable_reference_compare(paged_attention_test_params{ {{1, 1*4096}, {1, 1*1024}, {4096, 1024}}, 32, 8, 128, 128, 256, 0, ENABLE_CACHE_COMPRESSION, ov::internal::CacheQuantMode::BY_TOKEN, DYNAMIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, ENABLE_FA_V2, false, 0, {}, true, std::vector<float>{100.0f, 100.0f, 100.0f}, std::vector<int>{256, 256, 256} }),
+}));
+
+INSTANTIATE_TEST_SUITE_P(DISABLED_smoke_paged_attention_perf_cm_small_q, small_q_test,
+    ::testing::ValuesIn(std::vector<paged_attention_test_params>{
+        // Pure small-q spec-decoding: every subseq has 1 < q_len <= SMALL_Q_THRESHOLD
+        // and past_len > 0, so the SPLIT mixed router sends them all to
+        // pa_single_token + pa_single_token_finalization. xattention threshold
+        // 100.0 forces the multi-token path (none here) to bypass xattn estimation.
+        disable_reference_compare(paged_attention_test_params{
+            {{4, 1024}, {4, 2048}}, 32, 8, 128, 128, 256, 0,
+            DISABLE_CACHE_COMPRESSION, ov::internal::CacheQuantMode::BY_TOKEN,
+            STATIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2,
+            DISABLE_DIVERSITY, 0, {}, true,
+            std::vector<float>{100.0f, 100.0f},
+            std::vector<int>{256, 256},
+            ov::element::dynamic, true,
+            QueryToQueryAttentionDescriptor{
+                {std::vector<uint8_t>(16, 1), std::vector<uint8_t>(16, 1)},
+                {0, 16, 32}}
+        }),
+        // q == SMALL_Q_THRESHOLD upper boundary, two long-context subseqs.
+        disable_reference_compare(paged_attention_test_params{
+            {{16, 4096}, {16, 8192}}, 32, 8, 128, 128, 256, 0,
+            DISABLE_CACHE_COMPRESSION, ov::internal::CacheQuantMode::BY_TOKEN,
+            STATIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2,
+            DISABLE_DIVERSITY, 0, {}, true,
+            std::vector<float>{100.0f, 100.0f},
+            std::vector<int>{256, 256},
+            ov::element::dynamic, true,
+            QueryToQueryAttentionDescriptor{
+                {std::vector<uint8_t>(256, 1), std::vector<uint8_t>(256, 1)},
+                {0, 256, 512}}
+        }),
+        // Single subseq, q=4 (typical EAGLE spec window), medium context.
+        disable_reference_compare(paged_attention_test_params{
+            {{4, 1024}}, 32, 8, 128, 128, 256, 0,
+            DISABLE_CACHE_COMPRESSION, ov::internal::CacheQuantMode::BY_TOKEN,
+            STATIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2,
+            DISABLE_DIVERSITY, 0, {}, true,
+            std::vector<float>{100.0f},
+            std::vector<int>{256},
+            ov::element::dynamic, true,
+            QueryToQueryAttentionDescriptor{
+                {std::vector<uint8_t>(16, 1)},
+                {0, 16}}
+        }),
+        // Single subseq, q=16 upper boundary, long context.
+        disable_reference_compare(paged_attention_test_params{
+            {{16, 8192}}, 32, 8, 128, 128, 256, 0,
+            DISABLE_CACHE_COMPRESSION, ov::internal::CacheQuantMode::BY_TOKEN,
+            STATIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2,
+            DISABLE_DIVERSITY, 0, {}, true,
+            std::vector<float>{100.0f},
+            std::vector<int>{256},
+            ov::element::dynamic, true,
+            QueryToQueryAttentionDescriptor{
+                {std::vector<uint8_t>(256, 1)},
+                {0, 256}}
+        }),
 }));
 
 static constexpr int TOKEN_IDS_SEQ_LEN = 8192;
