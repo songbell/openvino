@@ -41,12 +41,20 @@ struct SingleTokenQChunking {
     int32_t q_head_chunk_size;
 };
 
-inline SingleTokenQChunking get_single_token_q_chunking(const kernel_impl_params& params, const paged_attention& desc, size_t kv_partition_size) {
-    // Must match kernel mapping in pa_single_token.cm:
+inline SingleTokenQChunking get_single_token_q_chunking(const kernel_impl_params& params,
+                                                         const paged_attention& desc,
+                                                         size_t kv_partition_size,
+                                                         int32_t tile_q_factor = 1) {
+    // Must match kernel mapping in pa_single_token.cm / pa_small_q.cm:
     //   kv_head_num_idx = gid1 / Q_head_chunks_per_kv_head
     //   head_num_idx    = gid1 * Q_head_chunk_size
     // Kernel does not guard extra heads, so we must ensure exact coverage:
     //   Q_head_chunks_per_kv_head * Q_head_chunk_size == q_heads_per_kv_head
+    //
+    // tile_q_factor is the number of q-tokens packed into one SG (1 for single-token,
+    // TILE_Q for pa_small_q). The resulting RepeatCount is q_head_chunk_size * tile_q_factor
+    // and must stay ≤ 8; the rS / Pmat / Omat tiles also scale linearly in tile_q_factor,
+    // so the GRF budget is divided accordingly.
     constexpr int32_t MaxRepeatCount = 8;
 
     const auto xe_arch = params.get_device_info().arch < gpu_arch::xe2 ? 1 : 2;
@@ -65,13 +73,32 @@ inline SingleTokenQChunking get_single_token_q_chunking(const kernel_impl_params
     const int32_t grf_bytes = (xe_arch == 1) ? 32 : 64;
     const int32_t budget_bytes = reg_file_size * grf_bytes - 1;
 
-    int32_t max_q_by_matrix = budget_bytes / (bytes_per_float * rs_cols);
+    // tile_q_factor == 1 (single-token): legacy budget — only rS counts. Keeps the
+    // historical chunk_size choices unchanged.
+    // tile_q_factor > 1 (small-q): full budget — every persistent tile (rS, Pmat,
+    // Omat, Qmat) scales by tile_q_factor, so we must account for all of them or
+    // chunk_size will overestimate and the kernel will spill / OOM the register file.
+    const int32_t safe_tile = (tile_q_factor < 1) ? 1 : tile_q_factor;
+    const int32_t head_size = static_cast<int32_t>(desc.k_head_size);
+    int32_t bytes_per_q_row;
+    if (safe_tile == 1) {
+        bytes_per_q_row = bytes_per_float * rs_cols;
+    } else {
+        // rS:fp32 + Pmat:fp16 over partition cols, Omat:fp32 + Qmat:fp16 over head_size cols.
+        bytes_per_q_row = 4 * static_cast<int32_t>(kv_partition_size)
+                        + 2 * static_cast<int32_t>(kv_partition_size)
+                        + 4 * head_size
+                        + 2 * head_size;
+    }
+    int32_t max_q_by_matrix = budget_bytes / (bytes_per_q_row * safe_tile);
     if (max_q_by_matrix < 1)
         max_q_by_matrix = 1;
 
-    const int32_t target_chunk = std::min<int32_t>(MaxRepeatCount, max_q_by_matrix);
+    const int32_t repeat_count_cap = MaxRepeatCount / safe_tile;
+    const int32_t target_chunk = std::min<int32_t>(repeat_count_cap, max_q_by_matrix);
 
     int32_t q_head_chunk_size = std::min<int32_t>(q_heads_per_kv_head, target_chunk);
+    if (q_head_chunk_size < 1) q_head_chunk_size = 1;
     while (q_head_chunk_size > 1 && (q_heads_per_kv_head % q_head_chunk_size) != 0) {
         --q_head_chunk_size;
     }
@@ -117,8 +144,11 @@ struct PagedAttentionRuntimeParams : public ImplRuntimeParams {
     size_t multi_token_wg_count = 0;  // Number of WGs required by pa_multi_token
 
     // small-q decode path (q_len > 1 spec-decoding subsequences)
-    size_t small_q_token_count = 0;  // Total (subseq, q-token) pairs routed to pa_small_q
-    size_t small_q_max_kv_len = 0;   // Max kv_len across small-q subsequences (for partition count)
+    size_t small_q_token_count = 0;       // Total (subseq, q-token) pairs routed to pa_small_q
+    size_t small_q_tile_count  = 0;       // Number of TILE_Q tiles (= number of dispatched SGs on GWS[0])
+    size_t small_q_max_kv_len = 0;        // Max kv_len across small-q subsequences (for partition count)
+    size_t small_q_num_of_partitions = 0; // Number of KV partitions used by pa_small_q (uses its own partition size)
+    SingleTokenQChunking small_q_chunking = {};  // Q-head chunking sized against the small-q partition
 
     // xattention runtime state
     bool enable_xattn_estimation = false;  // Whether xattn estimate stages are enabled
@@ -255,9 +285,9 @@ public:
     [[nodiscard]] DispatchDataFunc get_dispatch_data_func() const override;
 };
 
-// Small-q decode kernel for q_len > 1 subsequences. GWS fans the (subseq, q-token,
-// kv-partition, head-chunk) combinations out one per SG; reuses pa_single_token's
-// per-partition FA layout but indexes everything by a packed sel_idx.
+// Small-q decode kernel for q_len > 1 subsequences. GWS fans the (subseq tile,
+// kv-partition, head-chunk) combinations out one per SG; each SG covers TILE_Q
+// q-tokens of the same subsequence so K/V loads are shared across the spec window.
 class PagedAttentionGeneratorSmallQ : public PagedAttentionGeneratorBase {
 public:
     PagedAttentionGeneratorSmallQ() : PagedAttentionGeneratorBase("pa_small_q") {}
@@ -265,8 +295,15 @@ public:
     [[nodiscard]] Arguments get_arguments_desc(const kernel_impl_params& params) const override;
     [[nodiscard]] DispatchDataFunc get_dispatch_data_func() const override;
 
-    // Reuse single-token's partition-size policy: spec windows are short relative
-    // to past KV, so the large 256-token partition still amortises K/V loads well.
+    // Number of q-tokens packed per SG. Tied to the kernel's RepeatCount budget:
+    // RepeatCount = q_chunk_size * TILE_Q must stay ≤ 8 (DPAS limit).
+    // TILE_Q=2 with q_chunk_size=4 hits the systolic-array sweet spot.
+    static constexpr int32_t TILE_Q = 2;
+
+    // Partition size must be a multiple of KV_BLOCK_SIZE (PA_KV_CACHE_BLOCK_SIZE_XATTN = 256
+    // when has_xattention is on). Reuse single-token's policy so blocks_per_partition is
+    // an integer; q_chunk_size is reduced via the chunking solver to keep the rS / Pmat /
+    // Omat tiles within the GRF budget when expanded by TILE_Q.
     static size_t get_partition_size(const bool has_xattention = false) {
         return PagedAttentionGeneratorSingleToken::get_partition_size(has_xattention);
     }

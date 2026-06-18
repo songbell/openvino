@@ -261,6 +261,7 @@ public:
         rt_params->single_token_selected_count = 0;
         rt_params->multi_token_wg_count = 0;
         rt_params->small_q_token_count = 0;
+        rt_params->small_q_tile_count = 0;
         rt_params->small_q_max_kv_len = 0;
         rt_params->enable_xattn_estimation = false;
 
@@ -291,13 +292,16 @@ public:
                     const auto past_len = static_cast<size_t>(std::max<int32_t>(past_lens[subsequence_id], 0));
                     const bool decode_subsequence = (q_len == 1) && (past_len > 0);
                     // Small-q route: spec-decoding subsequences with q_len in (1, SMALL_Q_THRESHOLD]
-                    // and a non-empty past keep all tokens in pa_small_q. Each (subseq, q-token)
-                    // pair becomes one entry in the small_q_token_count map.
+                    // and a non-empty past go to pa_small_q. Tokens are packed into TILE_Q-sized
+                    // tiles so one SG covers TILE_Q q-tokens of the same subsequence; q_len that
+                    // is not a multiple of TILE_Q gets a final partial tile.
                     const bool small_q_subsequence = (q_len > 1) && (q_len <= SMALL_Q_THRESHOLD) && (past_len > 0);
                     if (decode_subsequence) {
                         rt_params->single_token_selected_count++;
                     } else if (small_q_subsequence) {
                         rt_params->small_q_token_count += q_len;
+                        rt_params->small_q_tile_count +=
+                            ceil_div(q_len, static_cast<size_t>(PagedAttentionGeneratorSmallQ::TILE_Q));
                         rt_params->small_q_max_kv_len = std::max(rt_params->small_q_max_kv_len, past_len + q_len);
                     } else {
                         rt_params->multi_token_wg_count += ceil_div(q_len, wg_seq_len);
@@ -311,6 +315,18 @@ public:
                 const auto partition_size = PagedAttentionGeneratorSingleToken::get_partition_size(desc->has_xattention);
                 rt_params->num_of_partitions = ceil_div(max_context_len, partition_size);
                 rt_params->q_chunking = get_single_token_q_chunking(params, *desc, partition_size);
+            }
+
+            if (use_split_mixed && rt_params->small_q_token_count > 0) {
+                // pa_small_q reuses single-token's partition size (KV_BLOCK_SIZE multiple),
+                // but expands the rS / Pmat / Omat tiles by TILE_Q in the q dimension.
+                // The chunking solver is told about TILE_Q so it shrinks q_head_chunk_size
+                // when the GRF budget is tight.
+                const auto small_q_partition = PagedAttentionGeneratorSmallQ::get_partition_size(desc->has_xattention);
+                rt_params->small_q_num_of_partitions = ceil_div(rt_params->small_q_max_kv_len, small_q_partition);
+                rt_params->small_q_chunking =
+                    get_single_token_q_chunking(params, *desc, small_q_partition,
+                                                 PagedAttentionGeneratorSmallQ::TILE_Q);
             }
 
             if (desc->has_xattention) {
@@ -413,12 +429,14 @@ public:
                         ", got ",
                         mapping_mem->count());
 
-        // Small-q mapping: pairs (orig_seq_idx, q_in_subseq), one entry per token.
+        // Small-q mapping: triples (orig_seq_idx, q_start_in_subseq, valid_count) per TILE_Q tile.
+        // Each SG processes TILE_Q q-tokens; the last tile of a subsequence may have
+        // valid_count < TILE_Q when q_len is not a multiple of TILE_Q.
         const bool has_small_q = rt_params->small_q_token_count > 0;
         std::optional<mem_lock<int32_t, mem_lock_type::write>> small_q_lock;
         size_t small_q_capacity = 0;
         size_t small_q_idx = 0;
-        const size_t expected_small_q_size = rt_params->small_q_token_count * 2;
+        const size_t expected_small_q_size = rt_params->small_q_tile_count * 3;
         if (has_small_q) {
             auto small_q_mem = instance.get_intermediates_memories()[PagedAttentionInternBuffIdx::SMALL_Q_SELECTED_MAPPING];
             small_q_capacity = small_q_mem->count();
@@ -458,14 +476,17 @@ public:
 
             if (small_q_subsequence) {
                 OPENVINO_ASSERT(small_q_lock.has_value(), "Small-q mapping buffer not locked but a small-q subsequence was found");
-                for (int32_t qi = 0; qi < q_len; ++qi) {
-                    OPENVINO_ASSERT(small_q_idx + 1 < small_q_capacity,
+                constexpr int32_t kTileQ = PagedAttentionGeneratorSmallQ::TILE_Q;
+                for (int32_t qi = 0; qi < q_len; qi += kTileQ) {
+                    const int32_t valid_count = std::min<int32_t>(kTileQ, q_len - qi);
+                    OPENVINO_ASSERT(small_q_idx + 2 < small_q_capacity,
                                     "Small-q mapping write out of bounds: idx=",
                                     small_q_idx,
                                     ", capacity=",
                                     small_q_capacity);
                     (*small_q_lock)[small_q_idx++] = static_cast<int32_t>(sequence_id);
-                    (*small_q_lock)[small_q_idx++] = qi;
+                    (*small_q_lock)[small_q_idx++] = qi;            // q_start_in_subseq
+                    (*small_q_lock)[small_q_idx++] = valid_count;   // 1..TILE_Q
                 }
                 continue;
             }
@@ -734,16 +755,25 @@ public:
 
             // Small-q decode scratch buffers. Always emitted in MIXED so the small-q stage
             // can be added unconditionally; sized to 1 when not used to avoid wasted memory.
+            // Tile-major layout: each SG covers TILE_Q q-tokens, so the partition_out / lse
+            // buffers are sized for tile_count × TILE_Q rows even when the last tile is
+            // partially valid (kernel writes -inf lse for invalid rows). Mapping is i32 triples.
             int64_t small_q_tmp_out_elems = 16;
             int64_t small_q_buf_elems = 16;
-            int64_t small_q_mapping_elems = 2;
+            int64_t small_q_mapping_elems = 3;
             if (needs_small_q_buffers) {
-                OPENVINO_ASSERT(rt_params->num_of_partitions != 0);
+                OPENVINO_ASSERT(rt_params->small_q_num_of_partitions != 0);
+                constexpr int32_t kTileQ = PagedAttentionGeneratorSmallQ::TILE_Q;
+                const int64_t tile_token_capacity =
+                    static_cast<int64_t>(rt_params->small_q_tile_count) * static_cast<int64_t>(kTileQ);
                 small_q_buf_elems =
-                    static_cast<int64_t>(rt_params->small_q_token_count * desc->heads_num * rt_params->num_of_partitions);
-                small_q_tmp_out_elems = static_cast<int64_t>(rt_params->small_q_token_count * desc->heads_num *
-                                                              desc->v_head_size * rt_params->num_of_partitions);
-                small_q_mapping_elems = static_cast<int64_t>(rt_params->small_q_token_count * 2);
+                    tile_token_capacity * static_cast<int64_t>(desc->heads_num) *
+                    static_cast<int64_t>(rt_params->small_q_num_of_partitions);
+                small_q_tmp_out_elems =
+                    tile_token_capacity * static_cast<int64_t>(desc->heads_num) *
+                    static_cast<int64_t>(desc->v_head_size) *
+                    static_cast<int64_t>(rt_params->small_q_num_of_partitions);
+                small_q_mapping_elems = static_cast<int64_t>(rt_params->small_q_tile_count) * 3;
             }
             internal_buffers.emplace_back(small_q_tmp_out_elems, ov::element::f32);                       // SMALL_Q_PARTITIONOUT
             internal_buffers.emplace_back(small_q_buf_elems, ov::element::f32);                           // SMALL_Q_EXPSUMS
