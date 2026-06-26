@@ -54,7 +54,6 @@ inline SingleTokenQChunking get_single_token_q_chunking(const kernel_impl_params
 
     // Match kernel arch-dependent params
     const int32_t reg_n = (xe_arch == 1) ? 8 : 16;
-    const int32_t kv_step = static_cast<int32_t>(get_kv_split_size(xe_arch).first);
     constexpr int32_t reg_m = 1;  // RepeatCount
     constexpr int32_t bytes_per_float = 4;
 
@@ -62,8 +61,7 @@ inline SingleTokenQChunking get_single_token_q_chunking(const kernel_impl_params
     // sized by ONLINE_TILE_SIZE (= ONLINE_TILE_STEPS * KV_STEP), NOT by KV_PARTITION_SIZE.
     // Must match #define ONLINE_TILE_STEPS in pa_single_token.cm.
     constexpr int32_t ONLINE_TILE_STEPS = 4;
-    const int32_t online_tile_step_num = ONLINE_TILE_STEPS;
-    const int32_t rs_cols = reg_m * online_tile_step_num * reg_n;
+    const int32_t rs_cols = reg_m * ONLINE_TILE_STEPS * reg_n;
     (void)kv_partition_size;  // kept for API compatibility; no longer drives chunk size
 
     const int32_t reg_file_size = PA_CM_REGISTER_FILE_SIZE;
