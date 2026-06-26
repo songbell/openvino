@@ -58,8 +58,13 @@ inline SingleTokenQChunking get_single_token_q_chunking(const kernel_impl_params
     constexpr int32_t reg_m = 1;  // RepeatCount
     constexpr int32_t bytes_per_float = 4;
 
-    const int32_t kv_partition_step_num = static_cast<int32_t>(kv_partition_size / kv_step);
-    const int32_t rs_cols = reg_m * kv_partition_step_num * reg_n;
+    // NOTE: Kernel uses online softmax tiling, so the peak rS register footprint is
+    // sized by ONLINE_TILE_SIZE (= ONLINE_TILE_STEPS * KV_STEP), NOT by KV_PARTITION_SIZE.
+    // Must match #define ONLINE_TILE_STEPS in pa_single_token.cm.
+    constexpr int32_t ONLINE_TILE_STEPS = 4;
+    const int32_t online_tile_step_num = ONLINE_TILE_STEPS;
+    const int32_t rs_cols = reg_m * online_tile_step_num * reg_n;
+    (void)kv_partition_size;  // kept for API compatibility; no longer drives chunk size
 
     const int32_t reg_file_size = PA_CM_REGISTER_FILE_SIZE;
     const int32_t grf_bytes = (xe_arch == 1) ? 32 : 64;
