@@ -594,16 +594,17 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
             for (int c = 0; c < REG_N; ++c) col_index[c] = c;
             const float NEG_INF = -3.4e38f;
 
-            // Per-row causal cap: for single-token decode, all Q_M_TILE rows
-            // share the same kv_len. For multi-token (Q_TOKENS_PER_WG>1),
-            // each token t sees past_q_lens + t + 1 keys.
+            // Per-row causal cap: each row maps to one (token_in_wg, q_head_in_t).
+            // token_in_wg = qi / Q_head_chunk_size
+            // For Q_TOKENS_PER_WG>1, token t corresponds to selected_q_mapping[base_sel_idx+t].
+            // For tokens beyond selected_token_count (padding), force mask_from=0
+            // so the entire row is NEG_INF (row contributes nothing to softmax).
             #pragma unroll
             for (int qi = 0; qi < Q_M_TILE; ++qi) {
-                // Determine per-row causal cap
-                // When Q_TOKENS_PER_WG=1, all rows use same kv_len.
-                // When Q_TOKENS_PER_WG>1, row qi maps to token qi/Q_head_chunk_size
                 const int token_in_wg = qi / Q_head_chunk_size;
-                const int kv_len_row = (int)(past_q_lens + q_in_subseq + token_in_wg + 1);
+                // Padding-aware: if (base_sel_idx + token_in_wg) is out of range, fully mask the row.
+                const bool row_valid = ((uint)base_sel_idx + token_in_wg) < (uint)selected_token_count;
+                const int kv_len_row = row_valid ? (int)(past_q_lens + q_in_subseq + token_in_wg + 1) : 0;
                 const int row_kv_in_partition = kv_len_row - kv_global_start;
                 const int mask_from = row_kv_in_partition > 0 ? row_kv_in_partition : 0;
 
@@ -925,7 +926,10 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
     vector<float, Q_M_TILE> cur_lse;
     #pragma unroll
     for (int row = 0; row < Q_M_TILE; row++) {
-        cur_lse[row] = cm_log<float>(running_sum[row]) * loge2 + running_max[row];
+        // Guard: if running_sum is 0 (all columns masked by causal), lse = -inf (neutral for finalization)
+        cur_lse[row] = (running_sum[row] > 0.0f)
+                       ? (cm_log<float>(running_sum[row]) * loge2 + running_max[row])
+                       : -3e38f;
     }
 
     // save Output. Each of the Q_M_TILE rows maps to:
@@ -946,22 +950,27 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
         uint o_offset = sel_idx_qi * kv_partition_num * HEADS_NUM * HEAD_SIZE
                       + kv_partition_num * (head_num_idx + q_head_in_t) * HEAD_SIZE
                       + kv_partition_idx * HEAD_SIZE;
-        float div_cur_sum = 1.0/cur_sum[qi];
+        // Guard: cur_sum > 0 (causal mask may zero out entire rows within a partition)
+        float div_cur_sum = (cur_sum[qi] > 0.0f) ? (1.0f / cur_sum[qi]) : 0.0f;
         auto Omat_slice = Omat[qi].format<float, HEAD_SIZE/REG_N * REG_M, REG_N>();
         #pragma unroll
         for(int k = 0, ri=0; k < HEAD_SIZE; k += REG_N, ri++) {
             auto cO = Omat_slice[ri].format<float, REG_M, REG_N>();
-            #if XE_ARCH==1
-            cur_O_f32 = cm_mul<float>(cO, div_cur_sum);
-            #else
-            cur_O_f32 = cm_div_ieee(cO, cur_sum[qi]);
-            #endif
+            if (cur_sum[qi] > 0.0f) {
+                #if XE_ARCH==1
+                cur_O_f32 = cm_mul<float>(cO, div_cur_sum);
+                #else
+                cur_O_f32 = cm_div_ieee(cO, cur_sum[qi]);
+                #endif
+            } else {
+                cur_O_f32 = 0.0f;
+            }
             cm_svm_block_write<float, REG_N>((svmptr_t)(output + o_offset + k), cur_O_f32.format<float>());
         }
         uint lse_offset = sel_idx_qi * HEADS_NUM * kv_partition_num
                         + (head_num_idx + q_head_in_t) * kv_partition_num
                         + kv_partition_idx;
-        lse[lse_offset] = cur_lse[qi];
+        lse[lse_offset] = (cur_sum[qi] > 0.0f) ? cur_lse[qi] : -3e38f;
     }
     } // End of PARTITIONS_PER_WORK_ITEM loop
 }
