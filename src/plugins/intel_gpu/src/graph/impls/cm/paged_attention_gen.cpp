@@ -457,6 +457,25 @@ JitConstants PagedAttentionGeneratorSingleToken::get_jit_constants(const kernel_
     jit.make("Q_head_chunks_per_kv_head", q_chunking.q_head_chunks_per_kv_head);
     jit.make("Q_head_chunk_size", q_chunking.q_head_chunk_size);
 
+    // Tunable: how many KV partitions one work-item processes serially.
+    const size_t partitions_per_wi_jit = get_pa_partitions_per_work_item();
+    jit.make("PARTITIONS_PER_WORK_ITEM", partitions_per_wi_jit);
+
+    // Tunable: how many query tokens one work-item processes in parallel (Q-tile DPAS fusion).
+    // Constrained by DPAS RepeatCount: Q_TOKENS_PER_WG * Q_head_chunk_size <= 8.
+    const size_t q_tokens_per_wg_eff = get_pa_q_tokens_per_wg(q_chunking.q_head_chunk_size);
+    jit.make("Q_TOKENS_PER_WG", q_tokens_per_wg_eff);
+
+    // Build-time tuning marker: this prints ONCE per JIT compilation (i.e. each
+    // time ov_cache is cleared and macros change). Confirms the *new* kernel
+    // is being compiled with the requested values.
+    std::cout << "[CM pa_single_token JIT] PARTITIONS_PER_WORK_ITEM=" << partitions_per_wi_jit
+              << ", Q_TOKENS_PER_WG=" << q_tokens_per_wg_eff
+              << ", Q_head_chunk_size=" << q_chunking.q_head_chunk_size
+              << ", KV_PARTITION_SIZE=" << kv_partition_size
+              << ", has_xattention=" << desc->has_xattention
+              << std::endl;
+
     // qq_bias tree mask is only consumed by the small-q (1 < q_len <= SMALL_Q_THRESHOLD)
     // route. The compile-time guard makes the mask block disappear for legacy q_len = 1
     // decode-only deployments that don't carry qq_bias inputs.
@@ -512,9 +531,35 @@ DispatchDataFunc PagedAttentionGeneratorSingleToken::get_dispatch_data_func() co
         const size_t kv_heads_num = desc->kv_heads_num;
         const size_t partition_num = rtp->num_of_partitions;
 
+        // Optimization: each work item processes multiple partitions to increase compute density
+        const size_t partitions_per_wi = get_pa_partitions_per_work_item();
+        const size_t partition_work_items = (partition_num + partitions_per_wi - 1) / partitions_per_wi;
+
+        // Q-tile parallelism: each work item processes multiple query tokens via fused DPAS
+        // Effective value depends on Q_head_chunk_size (DPAS RepeatCount <= 8 constraint).
+        const size_t q_tokens_per_wg = get_pa_q_tokens_per_wg(rtp->q_chunking.q_head_chunk_size);
+        const size_t q_token_work_items = (token_count + q_tokens_per_wg - 1) / q_tokens_per_wg;
+
         OPENVINO_ASSERT(rtp->q_chunking.q_head_chunks_per_kv_head > 0, "Invalid q_head_chunks_per_kv_head in runtime params");
-        wgs.global = {token_count, kv_heads_num * static_cast<size_t>(rtp->q_chunking.q_head_chunks_per_kv_head), partition_num};
+        wgs.global = {q_token_work_items, kv_heads_num * static_cast<size_t>(rtp->q_chunking.q_head_chunks_per_kv_head), partition_work_items};
         wgs.local = {1, 1, 1};
+
+        // One-time confirmation log. Enable via env var OV_GPU_LOG_PA_SINGLE_TOKEN.
+        static const bool s_log_pa_single_token = std::getenv("OV_GPU_LOG_PA_SINGLE_TOKEN") != nullptr;
+        if (s_log_pa_single_token) {
+            static bool s_logged = false;
+            if (!s_logged) {
+                std::cout << "[CM pa_single_token] PARTITIONS_PER_WORK_ITEM=" << partitions_per_wi
+                          << ", Q_TOKENS_PER_WG=" << q_tokens_per_wg
+                          << " (raw=" << get_pa_q_tokens_per_wg_raw() << ")"
+                          << ", q_head_chunk_size=" << rtp->q_chunking.q_head_chunk_size
+                          << ", DPAS_RepeatCount=" << (q_tokens_per_wg * rtp->q_chunking.q_head_chunk_size)
+                          << ", partition_num=" << partition_num
+                          << ", GWS=[" << wgs.global[0] << "," << wgs.global[1] << "," << wgs.global[2] << "]"
+                          << std::endl;
+                s_logged = true;
+            }
+        }
 
         auto& scalars = kd.params.scalars;
         std::vector<size_t> scaler_value = {1, token_count};
@@ -584,12 +629,17 @@ DispatchDataFunc PagedAttentionGeneratorSingleTokenFinalization::get_dispatch_da
 
         auto& scalars = kd.params.scalars;
         const size_t partition_num = rtp->num_of_partitions;
-        std::vector<size_t> scaler_value = {token_count, partition_num};
+        // Optimization: each work item processes multiple partitions, so we need padded count
+        const size_t partitions_per_wi = get_pa_partitions_per_work_item();
+        const size_t partition_work_items = (partition_num + partitions_per_wi - 1) / partitions_per_wi;
+        const size_t padded_partition_num = partition_work_items * partitions_per_wi;
+
+        std::vector<size_t> scaler_value = {token_count, padded_partition_num};
         scalars.resize(scaler_value.size());
 
         if (DEBUG_ENABLED) {
             std::cout << "PagedAttentionGeneratorSingleTokenFinalization::get_dispatch_data_func: token_count=" << token_count
-                      << ", partition_num=" << partition_num << ", gws=[" << wgs.global[0] << ", " << wgs.global[1] << ", " << wgs.global[2] << "]\n";
+                      << ", partition_num=" << partition_num << " (padded=" << padded_partition_num << "), gws=[" << wgs.global[0] << ", " << wgs.global[1] << ", " << wgs.global[2] << "]\n";
         }
         for (size_t i = 0; i < scaler_value.size(); ++i) {
             scalars[i].t = ScalarDescriptor::Types::INT32;

@@ -84,6 +84,88 @@ inline std::string get_pa_build_options() {
     return " -cmc -Qxcm_register_file_size=" + std::to_string(PA_CM_REGISTER_FILE_SIZE);
 }
 
+// pa_single_token tuning: how many KV partitions each work-item processes serially.
+// Default = 4, override via OV_GPU_PA_PARTITIONS_PER_WI environment variable.
+// Valid values: 1, 2, 4, 8, 16.
+// Larger value -> fewer workgroups (less scheduling overhead, better Q reuse)
+//                 but more serial work per work-item (less parallelism).
+inline size_t get_pa_partitions_per_work_item() {
+    static const size_t s_value = []() -> size_t {
+        const char* env = std::getenv("OV_GPU_PA_PARTITIONS_PER_WI");
+        size_t v = 4;  // default
+        if (env != nullptr) {
+            try {
+                v = static_cast<size_t>(std::stoul(env));
+            } catch (...) {
+                v = 4;
+            }
+        }
+        // Clamp to valid power-of-2 values
+        if (v < 1) v = 1;
+        if (v > 16) v = 16;
+        // Round to nearest power of 2 (1, 2, 4, 8, 16)
+        size_t p = 1;
+        while (p * 2 <= v) p *= 2;
+        return p;
+    }();
+    return s_value;
+}
+
+// pa_single_token Q-tile tuning: how many query tokens each work-item processes
+// in PARALLEL (single fused DPAS) sharing K/V loads. Override via
+// OV_GPU_PA_Q_TOKENS_PER_WG env var. Valid values: 1, 2, 4, 8.
+//
+// Larger value -> larger DPAS RepeatCount, K/V loads shared, fewer workgroups.
+//
+// HARDWARE CONSTRAINT (DPAS RepeatCount <= 8):
+//   Q_TOKENS_PER_WG * Q_head_chunk_size <= 8
+// If user-requested value violates this, host clamps it down silently.
+//
+// NOTE: assumes all tokens packed into one workgroup belong to the same subseq
+// (single-subseq Eagle3 spec decoding). Different subseqs in the pack would
+// have different past_lens / block_indices and break the K/V sharing.
+inline size_t get_pa_q_tokens_per_wg_raw() {
+    static const size_t s_value = []() -> size_t {
+        const char* env = std::getenv("OV_GPU_PA_Q_TOKENS_PER_WG");
+        size_t v = 1;  // default = baseline (no Q-tile parallelism)
+        if (env != nullptr) {
+            try {
+                v = static_cast<size_t>(std::stoul(env));
+            } catch (...) {
+                v = 1;
+            }
+        }
+        if (v < 1) v = 1;
+        if (v > 8) v = 8;
+        // Round to nearest power of 2 (1, 2, 4, 8)
+        size_t p = 1;
+        while (p * 2 <= v) p *= 2;
+        return p;
+    }();
+    return s_value;
+}
+
+// Effective Q_TOKENS_PER_WG after applying DPAS RepeatCount<=8 constraint.
+// q_head_chunk_size is the per-token M-tile already used for GQA grouping.
+inline size_t get_pa_q_tokens_per_wg(size_t q_head_chunk_size) {
+    constexpr size_t MAX_DPAS_REPEAT = 8;
+    size_t requested = get_pa_q_tokens_per_wg_raw();
+    if (q_head_chunk_size == 0) return 1;
+    size_t max_allowed = MAX_DPAS_REPEAT / q_head_chunk_size;
+    if (max_allowed < 1) max_allowed = 1;
+    // Clamp & round down to power of 2
+    size_t v = (requested > max_allowed) ? max_allowed : requested;
+    size_t p = 1;
+    while (p * 2 <= v) p *= 2;
+    return p;
+}
+
+// Convenience: when q_head_chunk_size is not yet known, assume the worst case
+// (q_head_chunk_size = 4 typical for GQA models) for buffer/dispatch budgeting.
+inline size_t get_pa_q_tokens_per_wg() {
+    return get_pa_q_tokens_per_wg_raw();
+}
+
 #define FIND_DEBUG_ACC 0
 // The block size for KV cache is set to 256 for xattn to achieve better performance.
 // For non-xattn case, it can be set to 16 for compatibility to legacy implementations.

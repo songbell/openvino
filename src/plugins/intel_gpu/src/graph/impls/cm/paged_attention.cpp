@@ -613,10 +613,15 @@ public:
             OPENVINO_ASSERT(rt_params->num_of_partitions != 0);
             size_t num_of_partitions = rt_params->num_of_partitions;
 
+            // Optimization: each work item processes multiple partitions
+            const size_t partitions_per_wi = get_pa_partitions_per_work_item();
+            const size_t partition_work_items = (num_of_partitions + partitions_per_wi - 1) / partitions_per_wi;
+            const size_t padded_partition_num = partition_work_items * partitions_per_wi;
+
             const auto& input = params.input_layouts[0];
             const int64_t total_tokens = input.get_partial_shape()[0].get_length();
-            auto buf_elements_count = static_cast<int64_t>(total_tokens * desc->heads_num * num_of_partitions);
-            auto tmp_out_elements_count = static_cast<int64_t>(total_tokens * desc->heads_num * desc->v_head_size * num_of_partitions);
+            auto buf_elements_count = static_cast<int64_t>(total_tokens * desc->heads_num * padded_partition_num);
+            auto tmp_out_elements_count = static_cast<int64_t>(total_tokens * desc->heads_num * desc->v_head_size * padded_partition_num);
 
             internal_buffers.emplace_back(tmp_out_elements_count, ov::element::f32);  // 0: intermediate partition output
             internal_buffers.emplace_back(buf_elements_count, ov::element::f32);      // 1: softmax exp_sums
@@ -633,9 +638,14 @@ public:
                 stage == PagedAttentionStage::MIXED && m_mixed_route_mode == MixedRouteMode::SPLIT && rt_params->single_token_selected_count > 0;
             if (needs_single_token_buffers) {
                 OPENVINO_ASSERT(rt_params->num_of_partitions != 0);
-                decode_buf_elements_count = static_cast<int64_t>(rt_params->single_token_selected_count * desc->heads_num * rt_params->num_of_partitions);
+                // Optimization: each work item processes multiple partitions
+                const size_t partitions_per_wi = get_pa_partitions_per_work_item();
+                const size_t partition_work_items = (rt_params->num_of_partitions + partitions_per_wi - 1) / partitions_per_wi;
+                const size_t padded_partition_num = partition_work_items * partitions_per_wi;
+
+                decode_buf_elements_count = static_cast<int64_t>(rt_params->single_token_selected_count * desc->heads_num * padded_partition_num);
                 decode_tmp_out_elements_count =
-                    static_cast<int64_t>(rt_params->single_token_selected_count * desc->heads_num * desc->v_head_size * rt_params->num_of_partitions);
+                    static_cast<int64_t>(rt_params->single_token_selected_count * desc->heads_num * desc->v_head_size * padded_partition_num);
             }
 
             internal_buffers.emplace_back(decode_tmp_out_elements_count, ov::element::f32);  // 0: DECODE_PARTITIONOUT (sized by token count for q_len >= 1)
