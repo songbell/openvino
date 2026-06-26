@@ -84,6 +84,27 @@ inline std::string get_pa_build_options() {
     return " -cmc -Qxcm_register_file_size=" + std::to_string(PA_CM_REGISTER_FILE_SIZE);
 }
 
+// pa_single_token tuning: override KV_PARTITION_SIZE via env var OV_GPU_PA_KV_PARTITION_SIZE.
+// Returns 0 if env var is not set (use default partition size based on has_xattention),
+// otherwise returns the requested value.
+// Constraints:
+//   - Must be a multiple of KV_BLOCK_SIZE (16 for legacy, 256 for xattention).
+//   - Must be a multiple of KV_STEP (16 for Xe2, 8 for Xe1).
+//   - Must be a multiple of ONLINE_TILE_SIZE (= ONLINE_TILE_STEPS * KV_STEP).
+//   - Larger value -> fewer partitions, more work per WG, more register pressure.
+inline size_t get_pa_kv_partition_size_override() {
+    static const size_t s_value = []() -> size_t {
+        const char* env = std::getenv("OV_GPU_PA_KV_PARTITION_SIZE");
+        if (env == nullptr) return 0;
+        try {
+            return static_cast<size_t>(std::stoul(env));
+        } catch (...) {
+            return 0;
+        }
+    }();
+    return s_value;
+}
+
 // pa_single_token tuning: how many KV partitions each work-item processes serially.
 // Default = 4, override via OV_GPU_PA_PARTITIONS_PER_WI environment variable.
 // Valid values: 1, 2, 4, 8, 16.
@@ -307,8 +328,13 @@ public:
     [[nodiscard]] DispatchDataFunc get_dispatch_data_func() const override;
 
     static size_t get_partition_size(const bool has_xattention = false) {
+        // Allow env var override (must satisfy block_size/KV_STEP/ONLINE_TILE_SIZE constraints).
+        const size_t env_override = get_pa_kv_partition_size_override();
+        if (env_override > 0) {
+            return env_override;
+        }
         // inheristic setting for single token to ensure the best performance, which is also verified by
-        // internal testing. We can consider to make it configurable if needed in the future.
+        // internal testing.
         if (!has_xattention && PA_KV_CACHE_BLOCK_SIZE_LEGACY < 128) {
             return 128;
         } else {
