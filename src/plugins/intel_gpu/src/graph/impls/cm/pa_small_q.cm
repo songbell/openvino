@@ -52,7 +52,7 @@ namespace KERNEL_NAME {
 // Overridable via JIT: -DONLINE_TILE_STEPS=N. When N == KV_PARTITION_STEP_NUM,
 // the online loop degenerates to a single iteration ("disable online softmax").
 #ifndef ONLINE_TILE_STEPS
-#define ONLINE_TILE_STEPS 8
+#define ONLINE_TILE_STEPS 16
 #endif
 #define ONLINE_TILE_SIZE (ONLINE_TILE_STEPS * KV_STEP)
 #define NUM_ONLINE_TILES (KV_PARTITION_STEP_NUM / ONLINE_TILE_STEPS)

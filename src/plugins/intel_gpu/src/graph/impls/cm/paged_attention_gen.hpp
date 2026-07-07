@@ -93,7 +93,7 @@ inline std::string get_pa_build_options() {
 //
 // The caller is responsible for clamping to at most (8 / q_head_chunk_size).
 inline int get_small_q_tile_q_raw(int xe_arch) {
-    int default_val = (xe_arch >= 2) ? 2 : 1;
+    int default_val = 1;
     if (const char* env = std::getenv("OV_GPU_PA_TILE_Q")) {
         int v = std::atoi(env);
         if (v >= 1 && v <= 8) {
