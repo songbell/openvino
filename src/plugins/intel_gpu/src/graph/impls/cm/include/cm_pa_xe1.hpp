@@ -24,6 +24,11 @@ void pa_lsc_u8(
     svmptr_t sparse_mask_base [[type("svmptr_t")]],
     svmptr_t wg_sparse_mask_base [[type("svmptr_t")]],
 #endif
+#if HAS_QQ_BIAS
+    svmptr_t qq_bias_base [[type("svmptr_t")]],
+    int32_t qq_bias_num,
+    int32_t qq_bias_spec_num,
+#endif
     svmptr_t o_base [[type("svmptr_t")]],
     int32_t past_lens,
     int32_t* block_indices [[type("svmptr_t")]]) {
@@ -290,6 +295,10 @@ void pa_lsc_u8(
                 // LSC ensures no overflow-access, but mask off k-tails attn-score is still required
                 for(int p = kv_tokens; p < kv_step; p++) St[p] = -3.4e38f;
             }
+#if HAS_QQ_BIAS
+            apply_qq_bias_tree_mask(St, qq_bias_base, qq_bias_num, qq_bias_spec_num,
+                                    kv_pos, q_start, (int)past_lens);
+#endif
             auto max_comp = online_softmax_update(St, cur_max, cur_sum);
 
             matrix<half, REG_N, REG_K> P;
@@ -351,6 +360,11 @@ void pa_kernel_lsc_prefetch_f16(
     svmptr_t sparse_mask_base [[type("svmptr_t")]],
     svmptr_t wg_sparse_mask_base [[type("svmptr_t")]],
 #endif
+#if HAS_QQ_BIAS
+    svmptr_t qq_bias_base [[type("svmptr_t")]],
+    int32_t qq_bias_num,
+    int32_t qq_bias_spec_num,
+#endif
     svmptr_t o_base [[type("svmptr_t")]],
     int32_t past_lens,
     int32_t* block_indices [[type("svmptr_t")]]) {
@@ -374,17 +388,6 @@ void pa_kernel_lsc_prefetch_f16(
     matrix <float, head_size/REG_M, REG_M*REG_N> rO;
     rO = 0;  // Initialize to prevent NaN from uninitialized values
     bool first_active = true;
-
-#if SPARSE_BLOCK_SIZE > 1
-    const int sb_shift = (SPARSE_BLOCK_SIZE == 128) ? 7 : (SPARSE_BLOCK_SIZE == 256) ? 8 : -1;
-    auto skip_by = [&](const bool* base, int kv_pos) -> bool {
-        if (sb_shift < 0) return false;
-        if (!base) return false;
-        return !base[(uint)kv_pos >> sb_shift];
-    };
-
-    auto skip_compute = [&](int kv_pos) { return skip_by((const bool*)sparse_mask_base, kv_pos); };
-#endif
 
     // clamp per-tile valid query tokens to [0, q_step]
     static_assert(q_step == REG_N);
@@ -454,6 +457,7 @@ void pa_kernel_lsc_prefetch_f16(
 
             auto skip_compute = [&](int pos) -> bool {
                 if (sb_shift < 0) return false;
+                if (!sparse_mask_base) return false;
                 return !*(reinterpret_cast<bool*>(sparse_mask_base) + ((uint)pos >> sb_shift));
             };
 
@@ -512,6 +516,11 @@ void pa_kernel_lsc_prefetch_f16(
             // LSC ensures no overflow-access, but mask off k-tails attn-score is still required
             for(int p = kv_tokens; p < kv_step; p++) St[p] = -3.4e38f;
         }
+
+#if HAS_QQ_BIAS
+        apply_qq_bias_tree_mask(St, qq_bias_base, qq_bias_num, qq_bias_spec_num,
+                                kv_pos, q_start, (int)past_lens);
+#endif
 
         // show(St);
         auto max_comp = online_softmax_update(St, cur_max, cur_sum);
