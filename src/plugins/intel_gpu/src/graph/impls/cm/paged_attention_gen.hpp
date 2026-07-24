@@ -40,6 +40,7 @@ inline std::pair<size_t, size_t> get_kv_split_size(size_t arch) {
 struct SingleTokenQChunking {
     int32_t q_head_chunks_per_kv_head;
     int32_t q_head_chunk_size;
+    int32_t tile_q;
 };
 
 inline SingleTokenQChunking get_single_token_q_chunking(const kernel_impl_params& params, const paged_attention& desc, size_t kv_partition_size) {
@@ -60,53 +61,35 @@ inline SingleTokenQChunking get_single_token_q_chunking(const kernel_impl_params
     constexpr int32_t bytes_per_float = 4;
 
     const int32_t kv_partition_step_num = static_cast<int32_t>(kv_partition_size / kv_step);
+    // rs_cols: columns of the full-partition rS matrix per Q-row (REG_M==1)
     const int32_t rs_cols = reg_m * kv_partition_step_num * reg_n;
 
     const int32_t reg_file_size = PA_CM_REGISTER_FILE_SIZE;
     const int32_t grf_bytes = (xe_arch == 1) ? 32 : 64;
     const int32_t budget_bytes = reg_file_size * grf_bytes - 1;
 
-    int32_t max_q_by_matrix = budget_bytes / (bytes_per_float * rs_cols);
-    if (max_q_by_matrix < 1)
-        max_q_by_matrix = 1;
+    // max Q_ROWS = budget / (4 * rs_cols), capped at MaxRepeatCount
+    int32_t max_q_rows = budget_bytes / (bytes_per_float * rs_cols);
+    if (max_q_rows < 1) max_q_rows = 1;
+    max_q_rows = std::min(max_q_rows, MaxRepeatCount);
 
-    const int32_t target_chunk = std::min<int32_t>(MaxRepeatCount, max_q_by_matrix);
-
-    int32_t q_head_chunk_size = std::min<int32_t>(q_heads_per_kv_head, target_chunk);
+    // q_head_chunk_size: must divide q_heads_per_kv_head exactly
+    int32_t q_head_chunk_size = std::min<int32_t>(q_heads_per_kv_head, max_q_rows);
     while (q_head_chunk_size > 1 && (q_heads_per_kv_head % q_head_chunk_size) != 0) {
         --q_head_chunk_size;
     }
     const int32_t q_head_chunks_per_kv_head = q_heads_per_kv_head / q_head_chunk_size;
 
-    return {q_head_chunks_per_kv_head, q_head_chunk_size};
+    // tile_q: pack multiple q-tokens per SG to saturate DPAS M-dimension
+    const int32_t safe_chunk = std::max(1, q_head_chunk_size);
+    int32_t tile_q = std::max(1, max_q_rows / safe_chunk);
+    tile_q = std::min(tile_q, MaxRepeatCount / safe_chunk);
+
+    return {q_head_chunks_per_kv_head, q_head_chunk_size, tile_q};
 }
 
 inline std::string get_pa_build_options() {
     return " -cmc -Qxcm_register_file_size=" + std::to_string(PA_CM_REGISTER_FILE_SIZE);
-}
-
-// TILE_Q: how many q-tokens each pa_small_q SG packs into the DPAS M dim.
-// Constraint: Q_head_chunk_size * TILE_Q <= 8 (DPAS RepeatCount cap).
-// Default: 2 on xe2/xe3 (satiates DPAS at Q_ROWS=8 for GQA-4), 1 on xe1
-// (register file half as big → wider M spills). Overridable via env
-// OV_GPU_PA_TILE_Q for testing.
-//
-// The caller is responsible for clamping to at most (8 / q_head_chunk_size).
-inline int get_small_q_tile_q_raw(int xe_arch) {
-    int default_val = (xe_arch >= 2) ? 2 : 1;
-    if (const char* env = std::getenv("OV_GPU_PA_TILE_Q")) {
-        int v = std::atoi(env);
-        if (v >= 1 && v <= 8) {
-            default_val = v;
-        }
-    }
-    return default_val;
-}
-
-inline int get_small_q_tile_q(int xe_arch, int q_head_chunk_size) {
-    int tile_q = get_small_q_tile_q_raw(xe_arch);
-    const int max_tile_q = std::max(1, 8 / std::max(1, q_head_chunk_size));
-    return std::min(tile_q, max_tile_q);
 }
 
 #define FIND_DEBUG_ACC 0
@@ -122,11 +105,11 @@ constexpr int STRIDE = 16;
 enum class PagedAttentionStage : uint8_t { GENERATE = 0, PREFILL = 1, MIXED = 2, UNKNOWN = 3 };
 enum class MixedRouteMode : uint8_t { MULTI = 0, SPLIT = 1 };
 
-// Subsequences with q_len in (1, SMALL_Q_THRESHOLD] and past_len > 0 are routed
-// to pa_small_q in split-mixed mode. Bound matches the typical EAGLE/draft
+// Subsequences with q_len in (1, THIN_Q_THRESHOLD] and past_len > 0 are routed
+// to single_token kernel in split-mixed mode. Bound matches the typical EAGLE/draft
 // spec_num = 16 and the Q_head_chunk_size × KV_PARTITION_STEP_NUM register
 // budget that fits the rS tile under -Qxcm_register_file_size.
-constexpr size_t SMALL_Q_THRESHOLD = 16;
+constexpr size_t THIN_Q_THRESHOLD = 16;
 struct PagedAttentionRuntimeParams : public ImplRuntimeParams {
     // common runtime state
     PagedAttentionStage stage;       // Current PA execution stage
@@ -137,15 +120,16 @@ struct PagedAttentionRuntimeParams : public ImplRuntimeParams {
     size_t num_of_partitions;                // Number of KV partitions for decode/finalization
     SingleTokenQChunking q_chunking;         // Cached single-token Q-head chunking parameters
     size_t single_token_selected_count = 0;  // Number of subsequences routed to single-token kernel
+    int single_token_tile_q = 1;             // default tile
 
     // multi-token dispatch size
     size_t multi_token_wg_count = 0;  // Number of WGs required by pa_multi_token
 
-    // small-q decode path (q_len > 1 spec-decoding subsequences)
-    size_t small_q_token_count = 0;  // Total (subseq, q-token) pairs routed to pa_small_q
-    size_t small_q_tile_count = 0;   // Number of SG tiles = ceil_div(small_q_token_count, TILE_Q)
-    int small_q_tile_q = 1;          // TILE_Q value chosen at JIT time (must match kernel)
-    size_t small_q_max_kv_len = 0;   // Max kv_len across small-q subsequences (for partition count)
+    // thin-q decode path (q_len > 1 spec-decoding subsequences)
+    //size_t thin_q_token_count = 0;  // Total (subseq, q-token) pairs routed
+    size_t thin_q_tile_count = 0;   // Number of SG tiles = ceil_div(thin_q_token_count, TILE_Q)
+    int thin_q_tile_q = 1;          // TILE_Q value chosen at JIT time (must match kernel)
+    size_t thin_q_max_kv_len = 0;   // Max kv_len across thin-q subsequences (for partition count)
 
     // xattention runtime state
     bool enable_xattn_estimation = false;  // Whether xattn estimate stages are enabled
@@ -184,14 +168,14 @@ enum PagedAttentionInternBuffIdx {
     XATTN_POST_WG_MAP = 10,      // 10: i32 pairs [subseq_id, merged_q_block_idx] for post-proc dispatch
 #if FIND_DEBUG_ACC
     XATTN_FIND_DEBUG_ACC = 11,  // 11: f16 debug-only KQ accumulation buffer
-    SMALL_Q_PARTITIONOUT = 12,
-    SMALL_Q_EXPSUMS = 13,
-    SMALL_Q_SELECTED_MAPPING = 14,
+    THIN_Q_PARTITIONOUT = 12,
+    THIN_Q_EXPSUMS = 13,
+    THIN_Q_SELECTED_MAPPING = 14,
 #else
     // Small-q decode scratch buffers (q_len > 1 spec-decoding path).
-    SMALL_Q_PARTITIONOUT = 11,      // f32 partial outputs indexed by (sel_idx, head, partition, head_size)
-    SMALL_Q_EXPSUMS = 12,           // f32 lse per (sel_idx, head, partition)
-    SMALL_Q_SELECTED_MAPPING = 13,  // i32 pairs [orig_seq_idx, q_in_subseq] per selected (seq, q-token)
+    THIN_Q_PARTITIONOUT = 11,      // f32 partial outputs indexed by (sel_idx, head, partition, head_size)
+    THIN_Q_EXPSUMS = 12,           // f32 lse per (sel_idx, head, partition)
+    THIN_Q_SELECTED_MAPPING = 13,  // i32 pairs [orig_seq_idx, q_in_subseq] per selected (seq, q-token)
 #endif
 };
 
@@ -277,31 +261,6 @@ public:
 class PagedAttentionGeneratorSingleTokenFinalization : public PagedAttentionGeneratorBase {
 public:
     PagedAttentionGeneratorSingleTokenFinalization() : PagedAttentionGeneratorBase("pa_single_token_finalization") {}
-    [[nodiscard]] JitConstants get_jit_constants(const kernel_impl_params& params) const override;
-    [[nodiscard]] Arguments get_arguments_desc(const kernel_impl_params& params) const override;
-    [[nodiscard]] DispatchDataFunc get_dispatch_data_func() const override;
-};
-
-// Small-q decode kernel for q_len > 1 subsequences. GWS fans the (subseq, q-token,
-// kv-partition, head-chunk) combinations out one per SG; reuses pa_single_token's
-// per-partition FA layout but indexes everything by a packed sel_idx.
-class PagedAttentionGeneratorSmallQ : public PagedAttentionGeneratorBase {
-public:
-    PagedAttentionGeneratorSmallQ() : PagedAttentionGeneratorBase("pa_small_q") {}
-    [[nodiscard]] JitConstants get_jit_constants(const kernel_impl_params& params) const override;
-    [[nodiscard]] Arguments get_arguments_desc(const kernel_impl_params& params) const override;
-    [[nodiscard]] DispatchDataFunc get_dispatch_data_func() const override;
-
-    // Reuse single-token's partition-size policy: spec windows are short relative
-    // to past KV, so the large 256-token partition still amortises K/V loads well.
-    static size_t get_partition_size(const bool has_xattention = false) {
-        return PagedAttentionGeneratorSingleToken::get_partition_size(has_xattention);
-    }
-};
-
-class PagedAttentionGeneratorSmallQFinalization : public PagedAttentionGeneratorBase {
-public:
-    PagedAttentionGeneratorSmallQFinalization() : PagedAttentionGeneratorBase("pa_small_q_finalization") {}
     [[nodiscard]] JitConstants get_jit_constants(const kernel_impl_params& params) const override;
     [[nodiscard]] Arguments get_arguments_desc(const kernel_impl_params& params) const override;
     [[nodiscard]] DispatchDataFunc get_dispatch_data_func() const override;

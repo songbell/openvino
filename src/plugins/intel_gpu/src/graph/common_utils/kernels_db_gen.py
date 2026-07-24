@@ -7,6 +7,7 @@ import argparse
 import glob
 import ntpath
 import re
+import locale
 
 class Code2CHeaders(object):
     def __init__(self, kernels_folder, headers_folder, lang):
@@ -14,6 +15,16 @@ class Code2CHeaders(object):
         self.headers_folder = os.path.abspath(headers_folder)
         self.language = lang
         assert(self.language == "ocl" or self.language == "cm")
+
+    @staticmethod
+    def read_text_file(file_path):
+        try:
+            with open(file_path, 'r', encoding='utf-8') as file:
+                return file.read()
+        except UnicodeDecodeError:
+            pref_enc = locale.getpreferredencoding(False) or 'utf-8'
+            with open(file_path, 'r', encoding=pref_enc) as file:
+                return file.read()
 
     def minimize_code(self, content):
         # Remove single-line comments (// ...)
@@ -61,8 +72,7 @@ class Code2CHeaders(object):
                 for path in include_paths:
                     full_path = os.path.join(path, include_file)
                     if os.path.isfile(full_path):
-                        with open(full_path, 'r') as f:
-                            included_content = f.read()
+                        included_content = self.read_text_file(full_path)
                         processed_includes.add(include_file)
                         return self.process_includes(included_content, include_paths, processed_includes)
             return ''
@@ -182,21 +192,20 @@ class Code2CHeaders(object):
     def process_file(self, filepath, include_dirs = [], is_batch_header = False):
         max_length = 5000
         filename = os.path.splitext(os.path.basename(filepath))[0]
-        with open(filepath, 'r') as file:
-            content = file.read()
+        content = self.read_text_file(filepath)
+        content = self.minimize_code(content)
+        if not is_batch_header:
+            content = self.process_includes(content, include_dirs)
             content = self.minimize_code(content)
-            if not is_batch_header:
-                content = self.process_includes(content, include_dirs)
-                content = self.minimize_code(content)
-                content = self.remove_unused_macros(content)
-                content = self.add_missing_undefs(content)
-            if len(content) > max_length:
-                parts = [content[i:i+max_length] for i in range(0, len(content), max_length)]
-                map_entry = '\n'.join([f'R"__krnl({part})__krnl"' for part in parts])
-            else:
-                map_entry = f'R"__krnl({content})__krnl"'
+            content = self.remove_unused_macros(content)
+            content = self.add_missing_undefs(content)
+        if len(content) > max_length:
+            parts = [content[i:i+max_length] for i in range(0, len(content), max_length)]
+            map_entry = '\n'.join([f'R"__krnl({part})__krnl"' for part in parts])
+        else:
+            map_entry = f'R"__krnl({content})__krnl"'
 
-            processed_code = f'std::make_pair<std::string_view, std::string_view>("{filename}", {map_entry}),\n'
+        processed_code = f'std::make_pair<std::string_view, std::string_view>("{filename}", {map_entry}),\n'
 
         return processed_code
 
@@ -250,7 +259,7 @@ def main():
     kernel_entries, header_entries = converter.generate()
 
     def write_to_file(file_path, content : list):
-        with open(file_path, 'w') as f:
+        with open(file_path, 'w', encoding='utf-8') as f:
             for entry in content:
                 f.write(entry)
 

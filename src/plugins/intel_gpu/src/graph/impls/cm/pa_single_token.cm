@@ -14,7 +14,25 @@
  * limitations under the License.
  *******************************************************************************/
 
-// xe-1:8, xe-2:16
+namespace KERNEL_NAME {
+
+// pa_single_token: merged single/multi-token decode kernel (replaces pa_small_q).
+//
+// TILE_Q >= 1 q-tokens per SG are packed from the same subsequence so K/V loads
+// are amortised and DPAS M-dimension is saturated from register budget.
+// TILE_Q == 1 degenerates to the original single-token decode behavior.
+// No online softmax: full-partition rS is materialised, then a single standard
+// softmax pass is applied per row. TILE_Q is chosen at JIT time via
+// get_single_token_tile_q() on the host.
+//
+// Dispatch: GWS = [tile_count, num_kv_heads * q_head_chunks_per_kv_head, partition_num]
+// selected_q_mapping: i32 triples [orig_seq_idx, q_start, valid_count] x tile_count.
+//   TILE_Q==1 (decode): (orig_seq_idx, 0, 1) for every selected sequence.
+//   TILE_Q >1 (multi):  consecutive tokens q_start..q_start+valid_count-1.
+// Output: f32 [tile_count * TILE_Q, head, partition, head_size]  (tile-major)
+// LSE:    f32 [tile_count * TILE_Q, head, partition]
+// Causal: token t in tile sees past_lens + q_start + t + 1 keys.
+
 #if XE_ARCH==1
 #define REG_N 8
 #define USE_LSC_BLOCK_2D_DESC 0
@@ -28,7 +46,10 @@
 #define VNNI_WIDTH 2
 #define REG_K (SystolicDepth * VNNI_WIDTH)
 #define REG_M RepeatCount
-#define KV_PARTITION_STEP_NUM  (KV_PARTITION_SIZE / KV_STEP)
+#define KV_PARTITION_STEP_NUM (KV_PARTITION_SIZE / KV_STEP)
+
+// Q_ROWS: DPAS repeat-count. Host ensures Q_head_chunk_size * TILE_Q <= 8.
+#define Q_ROWS (Q_head_chunk_size * TILE_Q)
 
 #if KV_CACHE_COMPRESSION
     // Currently supports 'by channel' and 'by token' for K, V still uses 'by token'.
@@ -47,7 +68,6 @@
     #define KV_ELEMENT_TYPE half
 #endif
 
-//prepack [K, N] to [K/2, N, 2] layout.
 template <typename T1, typename T2, int K, int N>
 inline void prepack_to_VNNI_W2(matrix_ref<T1, K, N> input, matrix_ref<T2, K/2, N*2> out) {
     #pragma unroll
@@ -73,30 +93,8 @@ CM_INLINE void Transpose_8x8(matrix_ref<T1, 8, 8> in, matrix_ref<T2, 8, 8> out) 
     }
 }
 
-// How multi-subsequence is supported in this kernel:
-// Because the single-token kernel often runs on a subset of sequences, not all sequences in the round.
-// Kernel metadata arrays (past_lens, subsequence_begins, block_indices_begins) are indexed by original sequence id.
-// The decode launch dimension is compact (batch_size = len(decode_seq_indices)), especially in mixed-route split.
-// selected_sequence_ids bridges compact decode batch index → original sequence index.
-// selected_sequence_count guards valid entries and avoids out-of-range threads.
-//
-// selected_sequence_ids:
-// Host-selected subsequence IDs for this launch (compact decode subset).
-// Each entry indexes global sequence metadata arrays:
-//   past_lens / block_indices_begins / subsequence_begins.
-// Workgroup seq_idx (cm_global_id(0)) maps through this array to get
-// the original sequence index (orig_seq_idx).
-//
-// Host preparation rules:
-// 1) Fill selected_sequence_ids with sequence IDs to run in this kernel.
-// 2) Keep order aligned with the compact output row order for this launch.
-// 3) Ensure every ID is in [0, total_sequence_count), and unique for decode.
-// 4) For this single-token path, each selected sequence must have exactly
-//    one query token in the current round (num_tokens == 1).
-//
-// selected_sequence_count:
-// - Number of valid entries in selected_sequence_ids.
-// - Bounds guard in kernel: seq_idx >= selected_sequence_count => return.
+// selected_q_mapping: i32 triples [orig_seq_idx, q_start, valid_count] per tile.
+//   TILE_Q==1 (decode): triple is (orig_seq_idx, 0, 1) per selected sequence.
 extern "C" _GENX_MAIN_ void KERNEL_NAME(
     half* query [[type("svmptr_t")]],
     KV_ELEMENT_TYPE* key [[type("svmptr_t")]],
@@ -105,178 +103,177 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
     int* block_indices [[type("svmptr_t")]],
     int* block_indices_begins [[type("svmptr_t")]],
     int* subsequence_begins [[type("svmptr_t")]],
-    int* selected_sequence_ids [[type("svmptr_t")]],
+#if HAS_QQ_BIAS
+    uchar* qq_bias [[type("svmptr_t")]],
+    int32_t* qq_bias_begins [[type("svmptr_t")]],
+#endif
+    int* selected_q_mapping [[type("svmptr_t")]],
     float* output [[type("svmptr_t")]],
     float* lse [[type("svmptr_t")]],
-    int q_len,// 1
-    int selected_sequence_count
+    int q_len_unused,
+    int selected_token_count
     ) {
-    //# batch=1, seq_num=1 or >1
-    //# query [seq_idx, seq_num, head_num, head_size]
-    //# output[seq_idx, seq_num, head_num, head_size]
-    //#   key [block_num, kv_head_num, block_size, head_size] + [block_num, kv_head_num, block_size, 4] (scale/zp)
-    //# value [block_num, kv_head_num, block_size, head_size] + [block_num, kv_head_num, block_size, 4] (scale/zp)
-
-    //# KV_PARTITION_SIZE should be multiple of kv_block_size(KV_BLOCK_SIZE)
-    //# kv_len dimision will be split into multiple partitions, each WG process a partition
-    //# total_partitions_num = kv_len // KV_PARTITION_SIZE
-    //
-    //# MaxRepeatCount = 8
-    //# q_heads_per_kv_head = num_heads / num_kv_heads
-    //#
-    //# Q_head_chunk_size is bounded not only by MaxRepeatCount,
-    //# but also by the per-thread register file budget implied by
-    //# -Qxcm_register_file_size and architecture GRF width
-    //# (xe1: 32B/GRF, xe2: 64B/GRF).
-    //#
-    //# In particular, the rS matrix:
-    //#   matrix<float, Q_head_chunk_size,
-    //#          REG_M * (KV_PARTITION_SIZE / KV_STEP) * REG_N>
-    //# must fit within the available register budget to avoid
-    //# excessive register pressure or CM build failures.
-    //#
-    //# Host side derives the maximum valid Q_head_chunk_size from
-    //# this constraint and adjusts q_head_chunks_per_kv_head
-    //# accordingly:
-    //#   q_head_chunks_per_kv_head = ceil_div(q_heads_per_kv_head, target_chunk)
-    //#   q_head_chunk_size         = ceil_div(q_heads_per_kv_head,
-    //#                                        q_head_chunks_per_kv_head)
-    //# GWS=[seq_num, num_kv_heads * q_head_chunks_per_kv_head, total_partitions_num]
-    //# LWS=[1, 1, 1]
-
-    //# Each WG processes a partition, which is KV_PARTITION_SIZE long and multiple of KV_BLOCK_SIZE.
-    //# KV_BLOCK_SIZE can be 32/64/128/256, etc.
-    const uint seq_idx = cm_global_id(0);
-    if (seq_idx >= selected_sequence_count) {
+    const uint tile_idx = cm_global_id(0);
+    if (tile_idx >= (uint)selected_token_count) {
         return;
     }
-    const uint orig_seq_idx = selected_sequence_ids[seq_idx];
-    const uint kv_head_num_idx = cm_global_id(1) / Q_head_chunks_per_kv_head;
-    const uint head_num_idx = cm_global_id(1) * Q_head_chunk_size;
-    //# KV_PARTITION_SIZE --> EU thread
-    const uint wg_thread_id = cm_global_id(2);
+
+    const uint orig_seq_idx = (uint)selected_q_mapping[tile_idx * 3 + 0];
+    const uint q_start      = (uint)selected_q_mapping[tile_idx * 3 + 1];
+    const uint valid_count  = (uint)selected_q_mapping[tile_idx * 3 + 2];
+
+    const uint kv_head_num_idx  = cm_global_id(1) / Q_head_chunks_per_kv_head;
+    const uint head_num_idx     = cm_global_id(1) * Q_head_chunk_size;
+    const uint wg_thread_id     = cm_global_id(2);
     const uint kv_partition_num = cm_group_count(2);
     const uint kv_partition_idx = cm_group_id(2);
 
     const int subseq_q_begin_i = subsequence_begins[orig_seq_idx];
-    const int subseq_q_end_i = subsequence_begins[orig_seq_idx + 1];
+    const int subseq_q_end_i   = subsequence_begins[orig_seq_idx + 1];
     if (subseq_q_end_i <= subseq_q_begin_i) {
         return;
     }
     const uint subseq_q_begin = (uint)subseq_q_begin_i;
-    const uint subseq_q_end = (uint)subseq_q_end_i;
-    const uint subseq_q_len = (uint)(subseq_q_end_i - subseq_q_begin_i);
 
-    // Single-token path uses the latest token from each subsequence.
-    const uint q_token_idx = subseq_q_end - 1;
-    const uint kv_len = past_lens[orig_seq_idx] + subseq_q_len;
-    const uint seq_kv_partition_num = (kv_len + KV_PARTITION_SIZE - 1) / KV_PARTITION_SIZE;
+    const uint past_q_lens = (uint)past_lens[orig_seq_idx];
+    const uint kv_len_max  = past_q_lens + q_start + valid_count;
+    const uint seq_kv_partition_num = (kv_len_max + KV_PARTITION_SIZE - 1) / KV_PARTITION_SIZE;
+
+#if HAS_QQ_BIAS
+    const int qq_bias_num_subseq = qq_bias_begins[orig_seq_idx + 1] - qq_bias_begins[orig_seq_idx];
+    const int qq_bias_off_subseq = qq_bias_begins[orig_seq_idx];
+    int qq_bias_spec_num = 0;
+    {
+        int s = 0;
+        while ((s + 1) * (s + 1) <= qq_bias_num_subseq) ++s;
+        qq_bias_spec_num = s;
+    }
+    uchar* qq_bias_subseq_ptr = qq_bias + qq_bias_off_subseq;
+#endif
 
     const uint block_begin = block_indices_begins[orig_seq_idx];
-    const uint block_end = block_indices_begins[orig_seq_idx + 1];
-    const uint total_blocks_num = block_end - block_begin;
-
-    // The code here requires KV_PARTITION_SIZE to be an integer multiple of KV_BLOCK_SIZE.
+    const uint block_end   = block_indices_begins[orig_seq_idx + 1];
     const uint blocks_per_partition = (KV_PARTITION_SIZE / KV_BLOCK_SIZE);
-    const uint start_block_idx = block_begin + kv_partition_idx * blocks_per_partition;
-
-    if(kv_partition_idx * KV_PARTITION_SIZE >= kv_len || start_block_idx >= block_end) {
-        // For sequences shorter than global kv_partition_num, this partition is inactive.
-        // Write neutral values so reduction kernel can safely process all partitions.
-        #pragma unroll
-        for (int qi = 0; qi < Q_head_chunk_size; qi++) {
-            matrix<float, REG_M, REG_N> zero = 0.0f;
-            uint o_offset = seq_idx * kv_partition_num * HEADS_NUM * HEAD_SIZE + kv_partition_num * (head_num_idx + qi) * HEAD_SIZE + wg_thread_id * HEAD_SIZE;
-            #pragma unroll
-            for (int k = 0; k < HEAD_SIZE; k += REG_N) {
-                cm_svm_block_write<float, REG_N>((svmptr_t)(output + o_offset + k), zero.format<float>());
-            }
-
-            uint lse_offset = seq_idx * HEADS_NUM * kv_partition_num + (head_num_idx + qi) * kv_partition_num + wg_thread_id;
-            lse[lse_offset] = -3e38f;
-        }
-        return;
-    }
     constexpr uint kv_pitch = HEAD_SIZE * sizeof(KV_ELEMENT_TYPE);
 
-    //# Load Q into register(as dpas-A tile)
-    const uint qo_offset = (q_token_idx * HEADS_NUM + head_num_idx) * HEAD_SIZE;
+    // Load Q for this tile (TILE_Q tokens x Q_head_chunk_size heads x HEAD_SIZE).
+    matrix<half, Q_ROWS, HEAD_SIZE> Qmat = 0;
+    #pragma unroll
+    for (int t = 0; t < TILE_Q; t++) {
+        if (t >= (int)valid_count) continue;
+        const uint q_token_idx = subseq_q_begin + q_start + t;
+        const uint qo_offset = (q_token_idx * HEADS_NUM + head_num_idx) * HEAD_SIZE;
+        cm_svm_block_read<half, Q_head_chunk_size * HEAD_SIZE>(
+            (svmptr_t)(query + qo_offset),
+            Qmat.select<Q_head_chunk_size, 1, HEAD_SIZE, 1>(t * Q_head_chunk_size, 0).format<half>());
+    }
 
-    matrix <half, Q_head_chunk_size, HEAD_SIZE> Qmat = 0;
-    cm_svm_block_read<half, Q_head_chunk_size * HEAD_SIZE>((svmptr_t)(query + qo_offset), Qmat.format<half>());
-
-    constexpr uint per_v_block_element_num = KV_BLOCK_SIZE * KV_HEADS_NUM * (HEAD_SIZE + V_SCALE_ZP_SIZE); // 0 or 4 bytes: scale/zp
+    constexpr uint per_v_block_element_num = KV_BLOCK_SIZE * KV_HEADS_NUM * (HEAD_SIZE + V_SCALE_ZP_SIZE);
     #if KV_CACHE_COMPRESSION == 1
-        constexpr uint per_k_block_element_num = KV_BLOCK_SIZE * KV_HEADS_NUM * (HEAD_SIZE + K_SCALE_ZP_SIZE); // 4 bytes: scale/zp
+        constexpr uint per_k_block_element_num = KV_BLOCK_SIZE * KV_HEADS_NUM * (HEAD_SIZE + K_SCALE_ZP_SIZE);
     #elif KV_CACHE_COMPRESSION == 2
-        constexpr uint per_k_block_element_num = KV_HEADS_NUM * HEAD_SIZE * (KV_BLOCK_SIZE + K_SCALE_ZP_SIZE); // 4 * GROUPS_PER_BLOCK bytes: scale/zp
+        constexpr uint per_k_block_element_num = KV_HEADS_NUM * HEAD_SIZE * (KV_BLOCK_SIZE + K_SCALE_ZP_SIZE);
     #else
         constexpr uint per_k_block_element_num = KV_BLOCK_SIZE * KV_HEADS_NUM * HEAD_SIZE;
     #endif
+
+    const uint base_token_row = tile_idx * TILE_Q;
+
+    // Write neutral output for out-of-range partitions.
+    if (kv_partition_idx >= seq_kv_partition_num) {
+        #pragma unroll
+        for (int t = 0; t < TILE_Q; t++) {
+            const uint token_row = base_token_row + t;
+            #pragma unroll
+            for (int qi = 0; qi < Q_head_chunk_size; qi++) {
+                matrix<float, REG_M, REG_N> zero = 0.0f;
+                uint o_offset = token_row * kv_partition_num * HEADS_NUM * HEAD_SIZE
+                              + kv_partition_num * (head_num_idx + qi) * HEAD_SIZE
+                              + kv_partition_idx * HEAD_SIZE;
+                #pragma unroll
+                for (int k = 0; k < HEAD_SIZE; k += REG_N)
+                    cm_svm_block_write<float, REG_N>((svmptr_t)(output + o_offset + k), zero.format<float>());
+                lse[token_row * HEADS_NUM * kv_partition_num + (head_num_idx + qi) * kv_partition_num + kv_partition_idx] = -3e38f;
+            }
+        }
+        return;
+    }
+
+    const uint start_block_idx = block_begin + kv_partition_idx * blocks_per_partition;
+
+    if (kv_partition_idx * KV_PARTITION_SIZE >= kv_len_max || start_block_idx >= block_end) {
+        #pragma unroll
+        for (int t = 0; t < TILE_Q; t++) {
+            const uint token_row = base_token_row + t;
+            #pragma unroll
+            for (int qi = 0; qi < Q_head_chunk_size; qi++) {
+                matrix<float, REG_M, REG_N> zero = 0.0f;
+                uint o_offset = token_row * kv_partition_num * HEADS_NUM * HEAD_SIZE
+                              + kv_partition_num * (head_num_idx + qi) * HEAD_SIZE
+                              + kv_partition_idx * HEAD_SIZE;
+                #pragma unroll
+                for (int k = 0; k < HEAD_SIZE; k += REG_N)
+                    cm_svm_block_write<float, REG_N>((svmptr_t)(output + o_offset + k), zero.format<float>());
+                lse[token_row * HEADS_NUM * kv_partition_num + (head_num_idx + qi) * kv_partition_num + kv_partition_idx] = -3e38f;
+            }
+        }
+        return;
+    }
+
     uint block_num = blocks_per_partition;
+    if (block_num > block_end - start_block_idx) block_num = block_end - start_block_idx;
 
     uint leftover_size = 0;
-    if(kv_partition_idx == seq_kv_partition_num - 1) {
-        // last partition
-        leftover_size = (kv_len - KV_PARTITION_SIZE * kv_partition_idx) % KV_PARTITION_SIZE;
-    }
-    if(block_num > block_end - start_block_idx) {
-        block_num = block_end - start_block_idx;
+    if (kv_partition_idx == seq_kv_partition_num - 1) {
+        leftover_size = (kv_len_max - KV_PARTITION_SIZE * kv_partition_idx) % KV_PARTITION_SIZE;
     }
 
-    //# rS = Q @ Kt
-	matrix<float, Q_head_chunk_size, REG_M * KV_PARTITION_STEP_NUM * REG_N> rS = 0;
+    // =========================================================================
+    // Phase 1: rS = Q @ Kt  (full partition, no online loop)
+    // =========================================================================
+    matrix<float, Q_ROWS, KV_PARTITION_STEP_NUM * REG_N> rS = 0;
 
-    // # Each SG can process multiple blocks
+    // =========================================================================
+    // K loop: each SG processes all blocks in the partition
+    // =========================================================================
     #pragma unroll
-    for(uint block_idx = 0, ki = 0; block_idx < block_num; block_idx++) {
-        // split kv_partition into multi kv_block
+    for (uint block_idx = 0, ki = 0; block_idx < block_num; block_idx++) {
         uint blk_indices = block_indices[start_block_idx + block_idx];
         uint k_base_offset = blk_indices * per_k_block_element_num + kv_head_num_idx * (per_k_block_element_num / KV_HEADS_NUM);
-        uint k_scale_zp_offset = k_base_offset + KV_BLOCK_SIZE * HEAD_SIZE; // scale/zp offset
+        uint k_scale_zp_offset = k_base_offset + KV_BLOCK_SIZE * HEAD_SIZE;
 
-    #if USE_LSC_BLOCK_2D_DESC
-        #if KV_CACHE_COMPRESSION
-            // Transpose only support dword and qwork
-            lsc::block_2d_desc<uint, 1, REG_N, REG_K/4> b2dK(reinterpret_cast<uint*>(key + k_base_offset),  KV_BLOCK_SIZE - 1, HEAD_SIZE*sizeof(uint8_t) - 1, kv_pitch - 1, 0, 0);
-        #else
-            lsc::block_2d_desc<uint, 1, REG_N, REG_K/2> b2dK(reinterpret_cast<uint*>(key + k_base_offset),  KV_BLOCK_SIZE - 1, HEAD_SIZE*sizeof(half) - 1, kv_pitch - 1, 0, 0);
-        #endif
+#if USE_LSC_BLOCK_2D_DESC
+    #if KV_CACHE_COMPRESSION
+        lsc::block_2d_desc<uint, 1, REG_N, REG_K/4> b2dK(reinterpret_cast<uint*>(key + k_base_offset), KV_BLOCK_SIZE - 1, HEAD_SIZE*sizeof(uint8_t) - 1, kv_pitch - 1, 0, 0);
     #else
+        lsc::block_2d_desc<uint, 1, REG_N, REG_K/2> b2dK(reinterpret_cast<uint*>(key + k_base_offset), KV_BLOCK_SIZE - 1, HEAD_SIZE*sizeof(half) - 1, kv_pitch - 1, 0, 0);
+    #endif
+#else
         uint kv_offset = k_base_offset;
         uint kv_stride = HEAD_SIZE;
-        uint kv_x0 = 0, kv_y0 = 0;
-        uint kv_x1 = HEAD_SIZE*sizeof(KV_ELEMENT_TYPE);
-        uint kv_y1 = KV_BLOCK_SIZE;
-    #endif
+#endif
 
         uint kv_pos_end = KV_BLOCK_SIZE;
-        if(block_idx == block_num - 1 && leftover_size > 0) {
+        if (block_idx == block_num - 1 && leftover_size > 0) {
             kv_pos_end = leftover_size % KV_BLOCK_SIZE;
-            if(kv_pos_end == 0) kv_pos_end = KV_BLOCK_SIZE;
+            if (kv_pos_end == 0) kv_pos_end = KV_BLOCK_SIZE;
         }
 
-        #if KV_CACHE_COMPRESSION
-            #if KV_CACHE_COMPRESSION == 1
-            // load scale/zp
-            vector<half, KV_BLOCK_SIZE> scale_vec;
-            vector<half, KV_BLOCK_SIZE> zp_vec;
-            cm_svm_block_read(reinterpret_cast<svmptr_t>(key + k_scale_zp_offset), scale_vec);
-            cm_svm_block_read(reinterpret_cast<svmptr_t>(key + k_scale_zp_offset + KV_BLOCK_SIZE * sizeof(half)), zp_vec);
-            if(kv_pos_end < KV_BLOCK_SIZE) {
-                // fill leftover with last valid scale/zp
-                #pragma unroll
-                for(int i = kv_pos_end; i < KV_BLOCK_SIZE; i++) {
-                    scale_vec[i] = 0.0;
-                    zp_vec[i] = 0.0;
-                }
+#if KV_CACHE_COMPRESSION == 1
+        vector<half, KV_BLOCK_SIZE> scale_vec;
+        vector<half, KV_BLOCK_SIZE> zp_vec;
+        cm_svm_block_read(reinterpret_cast<svmptr_t>(key + k_scale_zp_offset), scale_vec);
+        cm_svm_block_read(reinterpret_cast<svmptr_t>(key + k_scale_zp_offset + KV_BLOCK_SIZE * sizeof(half)), zp_vec);
+        if (kv_pos_end < KV_BLOCK_SIZE) {
+            #pragma unroll
+            for (int i = kv_pos_end; i < KV_BLOCK_SIZE; i++) {
+                scale_vec[i] = 0.0;
+                zp_vec[i] = 0.0;
             }
-            #elif KV_CACHE_COMPRESSION == 2
-            // TODO: Maybe using scale_vec and zp_vec would be better
-            #endif
-        #endif
+        }
+#endif
 
-        for(int kv_pos = 0; kv_pos < kv_pos_end; kv_pos += KV_STEP, ki++) {
+        for (int kv_pos = 0; kv_pos < (int)kv_pos_end; kv_pos += KV_STEP, ki++) {
             #if KV_CACHE_COMPRESSION == 1
                 #if USE_LSC_BLOCK_2D_DESC
                     vector<half, REG_N * 2> temp_scale, temp_zp;
@@ -329,15 +326,14 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                     KtNormal = cm_mul<half>(KtNormal, temp_scale);
                     Transpose_8x8(KtNormal.format<uint, REG_N, REG_K/2>(), Kt.format<uint, REG_K/2, REG_N>());
                     {
-                        // matrix<half, Q_head_chunk_size, REG_K> Qmat_data = Qmat.select<Q_head_chunk_size,1,REG_K,1>(0, (ri+ur)*REG_K);
-                        matrix<half, Q_head_chunk_size, REG_K> Qmat_data = Qmat.select<Q_head_chunk_size,1,REG_K,1>(0, (ri+ur)*REG_K);
-                        matrix<float, Q_head_chunk_size, REG_N> rS_data = 0;
-                        rS_data = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, Q_head_chunk_size>(
+                    matrix<half, Q_ROWS, REG_K> Qmat_data = Qmat.select<Q_ROWS,1,REG_K,1>(0, (ri+ur)*REG_K);
+                        matrix<float, Q_ROWS, REG_N> rS_data = 0;
+                        rS_data = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, Q_ROWS>(
                                     rS_data.format<float>(),
                                     Kt.format<int32_t>(),
                                     Qmat_data.format<int32_t>());
-                        // rS.select<Q_head_chunk_size, 1, REG_N, 1>(0, (ki+ur)*REG_N) += rS_data;
-                        rS.select<Q_head_chunk_size, 1, REG_N, 1>(0, ki*REG_N) += rS_data;
+                        // rS.select<Q_ROWS, 1, REG_N, 1>(0, (ki+ur)*REG_N) += rS_data;
+                        rS.select<Q_ROWS, 1, REG_N, 1>(0, ki*REG_N) += rS_data;
                     }
                 }
                 continue;
@@ -437,61 +433,130 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                 #endif
             #endif
             {
-                matrix<half, Q_head_chunk_size, REG_K> Qmat_data = Qmat.select<Q_head_chunk_size,1,REG_K,1>(0, ri*REG_K);
-                matrix<float, Q_head_chunk_size, REG_N> rS_data = 0;
-                rS_data = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, Q_head_chunk_size>(
+                matrix<half, Q_ROWS, REG_K> Qmat_data = Qmat.select<Q_ROWS,1,REG_K,1>(0, ri*REG_K);
+                matrix<float, Q_ROWS, REG_N> rS_data = 0;
+                rS_data = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, Q_ROWS>(
                             rS_data.format<float>(),
                             Kt.format<int32_t>(),
                             Qmat_data.format<int32_t>());
-                rS.select<Q_head_chunk_size, 1, REG_N, 1>(0, ki*REG_N) += rS_data;
+                rS.select<Q_ROWS, 1, REG_N, 1>(0, ki*REG_N) += rS_data;
             }
             }
         }
     }
 
-    // online softmax
-    vector<float, Q_head_chunk_size> cur_sum = 0.0f;
-    vector<float, Q_head_chunk_size> cur_lse = 0.0f;
-    matrix<half, Q_head_chunk_size, KV_PARTITION_STEP_NUM * REG_M * REG_N> Pmat = 0;
-    #pragma unroll
-    for(int qi = 0; qi < Q_head_chunk_size; qi++) {
-        auto rS_slice = rS[qi].format<float, KV_PARTITION_STEP_NUM, REG_N>();
-        rS_slice = cm_mul<float>(rS_slice, (float)SCALE_FACTOR);  // convert scale_factor into (float), or it will be promoted to double
+    // =========================================================================
+    // Phase 2: Scale + leftover mask + per-row causal mask
+    // =========================================================================
+    rS = cm_mul<float>(rS, (float)SCALE_FACTOR);
 
-        if(leftover_size > 0) {
-            auto Svec = rS_slice.format<float>();
-            for(int i = leftover_size; i < KV_PARTITION_STEP_NUM * REG_N; i++){
-                Svec[i] = -3e38f;
+    {
+        const int kv_global_start = (int)(kv_partition_idx * KV_PARTITION_SIZE);
+        vector<int, REG_N> col_index;
+        #pragma unroll
+        for (int c = 0; c < REG_N; ++c) col_index[c] = c;
+        const float NEG_INF = -3.4e38f;
+
+        // Leftover mask: columns beyond valid KV range in last partition.
+        if (leftover_size > 0) {
+            #pragma unroll
+            for (int b = 0; b < KV_PARTITION_STEP_NUM; ++b) {
+                const int col_abs = b * REG_N;
+                if (col_abs >= (int)leftover_size) {
+                    #pragma unroll
+                    for (int row = 0; row < Q_ROWS; ++row)
+                        rS.select<1, 1, REG_N, 1>(row, b * REG_N) = NEG_INF;
+                } else if (col_abs + REG_N > (int)leftover_size) {
+                    const int local_mask = (int)leftover_size - col_abs;
+                    vector<unsigned short, REG_N> m = col_index >= local_mask;
+                    #pragma unroll
+                    for (int row = 0; row < Q_ROWS; ++row) {
+                        auto blk = rS.select<1, 1, REG_N, 1>(row, b * REG_N).format<float, 1, REG_N>().row(0);
+                        blk.merge(NEG_INF, m);
+                    }
+                }
             }
         }
 
-        // compute lse
-        constexpr float log2e = 1.4426950408889634f;
-        constexpr float loge2 = 0.6931471805599453f;
+        // Per-row causal mask (token t sees past_q_lens + q_start + t + 1 keys).
+        #pragma unroll
+        for (int t = 0; t < TILE_Q; ++t) {
+            const int kv_len_t = (t < (int)valid_count) ? (int)(past_q_lens + q_start + t + 1) : 0;
+            const int mask_from = kv_len_t - kv_global_start;
+            #pragma unroll
+            for (int qi = 0; qi < Q_head_chunk_size; ++qi) {
+                const int row = t * Q_head_chunk_size + qi;
+                auto rs_row = rS[row].format<float, KV_PARTITION_STEP_NUM, REG_N>();
+                #pragma unroll
+                for (int b = 0; b < KV_PARTITION_STEP_NUM; ++b) {
+                    const int blk_lo = b * REG_N;
+                    if (blk_lo >= mask_from) {
+                        rs_row.row(b) = NEG_INF;
+                    } else if (blk_lo + REG_N > mask_from) {
+                        vector<unsigned short, REG_N> m = col_index >= (mask_from - blk_lo);
+                        auto blk = rs_row.row(b);
+                        blk.merge(NEG_INF, m);
+                    }
+                }
+            }
+        }
 
-        // compute row_max
-        auto rSv = rS_slice.format<float>();
-        #if XE_ARCH==1
-        float row_max = cm_reduced_max<float>(rSv);
-        #else
-        float row_max = rSv[0];
-        // It is performance hotspot for u8,  must add unroll
+#if HAS_QQ_BIAS
+        if (qq_bias_num_subseq > 0 && qq_bias_spec_num > 0) {
+            #pragma unroll
+            for (int t = 0; t < TILE_Q; ++t) {
+                if (t >= (int)valid_count) continue;
+                const int query_spec = (int)q_start + t;
+                if (query_spec < 0 || query_spec >= qq_bias_spec_num) continue;
+                #pragma unroll
+                for (int qi = 0; qi < Q_head_chunk_size; ++qi) {
+                    const int row = t * Q_head_chunk_size + qi;
+                    auto rs_row = rS[row].format<float, KV_PARTITION_STEP_NUM, REG_N>();
+                    #pragma unroll
+                    for (int b = 0; b < KV_PARTITION_STEP_NUM; ++b) {
+                        #pragma unroll
+                        for (int c = 0; c < REG_N; ++c) {
+                            const int key_local = kv_global_start + b * REG_N + c;
+                            const int key_spec = key_local - (int)past_q_lens;
+                            if (key_spec < 0 || key_spec >= qq_bias_spec_num) continue;
+                            const int qq_off = query_spec * qq_bias_spec_num + key_spec;
+                            if (qq_bias_subseq_ptr[qq_off] == 0) rs_row(b, c) = NEG_INF;
+                        }
+                    }
+                }
+            }
+        }
+#endif
+    }
+
+    // =========================================================================
+    // Phase 3: Standard per-row softmax → Pmat, cur_sum, cur_lse
+    // =========================================================================
+    constexpr float log2e = 1.4426950408889634f;
+    constexpr float loge2 = 0.6931471805599453f;
+
+    vector<float, Q_ROWS> cur_sum = 0.0f;
+    vector<float, Q_ROWS> cur_lse;
+    matrix<half, Q_ROWS, KV_PARTITION_STEP_NUM * REG_N> Pmat = 0;
+
+    #pragma unroll
+    for (int row = 0; row < Q_ROWS; row++) {
+        auto rS_row = rS[row].format<float>();
+
+        float row_max = rS_row[0];
+        // It is a performance hotspot for u8, must add unroll
         #if KV_CACHE_COMPRESSION
         #pragma unroll
         #endif
-        for(int r = 1; r < rSv.n_elems(); r++)
-            row_max = cm_max<float>(row_max, rSv[r]);
-        #endif
+        for (int r = 1; r < rS_row.n_elems(); r++)
+            row_max = cm_max<float>(row_max, rS_row[r]);
 
-        // compute Pmat = exp(rS_slice - row_max)
-        vector<float, KV_PARTITION_STEP_NUM * REG_N> rS_exp_temp = cm_exp((rSv - row_max)*log2e);
-        Pmat[qi].format<half, KV_PARTITION_STEP_NUM * REG_M, REG_N>() = rS_exp_temp;
-
-        cur_lse[qi] = cm_sum<float>(rS_exp_temp.format<float>());
-        cur_lse[qi] = cm_log<float>(cur_lse[qi]) * loge2 + row_max; // log2(sum(exp(x))) = log2e * log(sum(exp(x)))
-
-        // compute row sum of P
-        cur_sum[qi] = cm_sum<float>(Pmat[qi]);
+        vector<float, KV_PARTITION_STEP_NUM * REG_N> exp_vals = cm_exp((rS_row - row_max) * log2e);
+        cur_sum[row] = cm_sum<float>(exp_vals);
+        cur_lse[row] = (cur_sum[row] > 0.0f)
+            ? (cm_log<float>(cur_sum[row]) * loge2 + row_max)
+            : -3e38f;
+        Pmat[row] = exp_vals;
     }
     
     #if !USE_LSC_BLOCK_2D_DESC && KV_CACHE_COMPRESSION
@@ -499,29 +564,25 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
     #else
     constexpr uint VALUE_TILE_NUM=1;
     #endif
-    //# rO = P * V
-    matrix <float, Q_head_chunk_size, HEAD_SIZE/REG_N * REG_M*REG_N> Omat = 0;
+    // Phase 4: Omat = Pmat @ V
+    matrix<float, Q_ROWS, HEAD_SIZE> Omat = 0;
     #pragma unroll
-    for(uint block_idx = 0, ki = 0; block_idx < block_num; block_idx++) {
+    for (uint block_idx = 0, ki = 0; block_idx < block_num; block_idx++) {
         uint blk_indices = block_indices[start_block_idx + block_idx];
         uint v_base_offset = blk_indices * per_v_block_element_num + kv_head_num_idx * (per_v_block_element_num / KV_HEADS_NUM);
-        uint v_scale_zp_offset = v_base_offset + KV_BLOCK_SIZE * HEAD_SIZE; // scale/zp offset
+        uint v_scale_zp_offset = v_base_offset + KV_BLOCK_SIZE * HEAD_SIZE;
 
-    #if USE_LSC_BLOCK_2D_DESC
+#if USE_LSC_BLOCK_2D_DESC
         //# vector load cannot be used for block_2d_desc
-        //# note: candidate template ignored: deduced type 'details::Block2DRefTy<half, 1U, 16U, 1U, (LoadOp)0U>' (aka 'vector_ref<half,32>') of 1st parameter
         #if KV_CACHE_COMPRESSION
-        lsc::block_2d_desc<uint8_t, 1, REG_K, REG_N> b2dV(value + v_base_offset,  KV_BLOCK_SIZE - 1, HEAD_SIZE*sizeof(uint8_t) - 1, kv_pitch - 1, 0, 0);
+        lsc::block_2d_desc<uint8_t, 1, REG_K, REG_N> b2dV(value + v_base_offset, KV_BLOCK_SIZE - 1, HEAD_SIZE*sizeof(uint8_t) - 1, kv_pitch - 1, 0, 0);
         #else
-        lsc::block_2d_desc<half, 1, REG_K, REG_N>   b2dV(value + v_base_offset,  KV_BLOCK_SIZE - 1, HEAD_SIZE * sizeof(half) - 1, kv_pitch - 1, 0, 0);
+        lsc::block_2d_desc<half, 1, REG_K, REG_N> b2dV(value + v_base_offset, KV_BLOCK_SIZE - 1, HEAD_SIZE * sizeof(half) - 1, kv_pitch - 1, 0, 0);
         #endif
-    #else
+#else
         uint kv_offset = v_base_offset;
         uint kv_stride = HEAD_SIZE;
-        uint kv_x0 = 0, kv_y0 = 0;
-        uint kv_x1 = HEAD_SIZE*sizeof(half);
-        uint kv_y1 = KV_BLOCK_SIZE;
-    #endif
+#endif
         uint kv_pos_end = KV_BLOCK_SIZE;
         if(block_idx == block_num - 1 && leftover_size > 0) {
             kv_pos_end = leftover_size % KV_BLOCK_SIZE;
@@ -617,11 +678,11 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                                 }
                             }
                         #endif
-                        matrix<half, Q_head_chunk_size, REG_K> Pmat_data = Pmat.select<Q_head_chunk_size,1,REG_K,1>(0, ki*REG_K);
+        matrix<half, Q_ROWS, REG_K> Pmat_data = Pmat.select<Q_ROWS,1,REG_K,1>(0, ki*REG_K);
                         #pragma unroll
                         for (int tile=0; tile < VALUE_TILE_NUM; tile ++) {
-                            auto Omat_data = Omat.select<Q_head_chunk_size,1,REG_N,1>(0, (ri_ur + tile)*REG_N);
-                            Omat_data = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, Q_head_chunk_size>(
+                            auto Omat_data = Omat.select<Q_ROWS,1,REG_N,1>(0, (ri_ur + tile)*REG_N);
+                            Omat_data = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, Q_ROWS>(
                                         Omat_data.format<float>(),
                                         Vmat.format<half, REG_K/2, REG_N*2*VALUE_TILE_NUM>().select<REG_K/2, 1, REG_N*2, 1>(0, REG_N*2*tile).format<int32_t>(),
                                         Pmat_data.format<int32_t>());
@@ -681,11 +742,11 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
                     }
                 }
             #endif
-            matrix<half, Q_head_chunk_size, REG_K> Pmat_data = Pmat.select<Q_head_chunk_size,1,REG_K,1>(0, ki*REG_K);
+            matrix<half, Q_ROWS, REG_K> Pmat_data = Pmat.select<Q_ROWS,1,REG_K,1>(0, ki*REG_K);
             #pragma unroll
             for (int tile=0; tile < VALUE_TILE_NUM; tile ++) {
-                auto Omat_data = Omat.select<Q_head_chunk_size,1,REG_N,1>(0, (ri + tile)*REG_N);
-                Omat_data = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, Q_head_chunk_size>(
+                auto Omat_data = Omat.select<Q_ROWS,1,REG_N,1>(0, (ri + tile)*REG_N);
+                Omat_data = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, Q_ROWS>(
                             Omat_data.format<float>(),
                             Vmat.format<half, REG_K/2, REG_N*2*VALUE_TILE_NUM>().select<REG_K/2, 1, REG_N*2, 1>(0, REG_N*2*tile).format<int32_t>(),
                             Pmat_data.format<int32_t>());
@@ -694,24 +755,41 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
         }
     }
 
-    // save Output
+    // =========================================================================
+    // Phase 5: Normalize and write output (tile-major layout)
+    // =========================================================================
     #pragma unroll
-    for (int qi = 0; qi < Q_head_chunk_size; qi++) {
-        matrix<float, REG_M, REG_N> cur_O_f32;
-        uint o_offset = seq_idx * kv_partition_num * HEADS_NUM * HEAD_SIZE + kv_partition_num * (head_num_idx + qi) * HEAD_SIZE + wg_thread_id * HEAD_SIZE;
-        float div_cur_sum = 1.0/cur_sum[qi];
-        auto Omat_slice = Omat[qi].format<float, HEAD_SIZE/REG_N * REG_M, REG_N>();
+    for (int t = 0; t < TILE_Q; t++) {
+        const uint token_row = base_token_row + t;
+        const bool row_valid = (t < (int)valid_count);
         #pragma unroll
-        for(int k = 0, ri=0; k < HEAD_SIZE; k += REG_N, ri++) {
-            auto cO = Omat_slice[ri].format<float, REG_M, REG_N>();
-            #if XE_ARCH==1
-            cur_O_f32 = cm_mul<float>(cO, div_cur_sum);
-            #else
-            cur_O_f32 = cm_div_ieee(cO, cur_sum[qi]);
-            #endif
-            cm_svm_block_write<float, REG_N>((svmptr_t)(output + o_offset + k), cur_O_f32.format<float>());
+        for (int qi = 0; qi < Q_head_chunk_size; qi++) {
+            const int row = t * Q_head_chunk_size + qi;
+            matrix<float, REG_M, REG_N> cur_O_f32;
+            uint o_offset = token_row * kv_partition_num * HEADS_NUM * HEAD_SIZE
+                          + kv_partition_num * (head_num_idx + qi) * HEAD_SIZE
+                          + kv_partition_idx * HEAD_SIZE;
+            auto Omat_slice = Omat[row].format<float, HEAD_SIZE/REG_N * REG_M, REG_N>();
+            #pragma unroll
+            for (int k = 0, ri = 0; k < HEAD_SIZE; k += REG_N, ri++) {
+                auto cO = Omat_slice[ri].format<float, REG_M, REG_N>();
+                if (row_valid && cur_sum[row] > 0.0f) {
+#if XE_ARCH==1
+                    cur_O_f32 = cm_mul<float>(cO, 1.0f / cur_sum[row]);
+#else
+                    cur_O_f32 = cm_div_ieee(cO, cur_sum[row]);
+#endif
+                } else {
+                    cur_O_f32 = 0.0f;
+                }
+                cm_svm_block_write<float, REG_N>((svmptr_t)(output + o_offset + k), cur_O_f32.format<float>());
+            }
+            uint lse_offset = token_row * HEADS_NUM * kv_partition_num
+                            + (head_num_idx + qi) * kv_partition_num
+                            + kv_partition_idx;
+            lse[lse_offset] = (row_valid && cur_sum[row] > 0.0f) ? cur_lse[row] : -3e38f;
         }
-        uint lse_offset = seq_idx * HEADS_NUM * kv_partition_num + (head_num_idx + qi) * kv_partition_num + wg_thread_id;
-        lse[lse_offset] = cur_lse[qi];
     }
 }
+
+}  // namespace KERNEL_NAME
