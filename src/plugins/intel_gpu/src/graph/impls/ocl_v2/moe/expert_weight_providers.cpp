@@ -277,7 +277,7 @@ void OffloadExpertWeightProvider::prefetch_les_demand(const std::vector<uint32_t
             }
         }
         std::vector<uint32_t> selected;
-        const auto budget = moe_otd::LesSpeculationPolicy::expert_budget(_capacity, _prefetch_expert_bytes);
+        const auto budget = moe_otd::LesSpeculationPolicy::expert_budget(_capacity, _prefetch_expert_bytes, _config.top_k);
         for (auto expert : experts) {
             if (selected.size() == budget) {
                 break;

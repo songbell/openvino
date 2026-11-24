@@ -543,11 +543,12 @@ ID readback still have a Host wait; weight reads/repacking/uploads run on the
 worker and no longer block the source until their completion. This enables
 overlap but is not a new measured device-overlap or speedup claim.
 
-`LesSpeculationPolicy` separates `lookahead_layers=1` from `predict_k=4`.
-Each provider keeps at most one speculative batch. Its admission limit is the
-minimum of four experts, `max(1, capacity / 4)` slots and 16 MiB divided by the
-complete per-expert W/S/ZP byte size. Capacity one, zero-byte metadata and experts
-larger than 16 MiB disable speculation. These are fixed internal limits, not new
+`LesSpeculationPolicy` keeps a one-layer lookahead. Each provider keeps at most
+one speculative batch. Its admission limit is the minimum of the router `top_k`,
+the slots left after the layer's own `top_k` demand (`capacity - top_k`) and 32 MiB
+divided by the complete per-expert W/S/ZP byte size. A capacity not above `top_k`
+and zero-byte metadata disable speculation. `MOE_LES_PREFETCH_EXPERTS` overrides
+the limit for experiments (0 disables prefetch). These are internal limits, not new
 public properties or a cross-layer memory budget. No adaptive or trained
 predictor is required.
 

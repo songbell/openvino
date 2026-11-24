@@ -60,8 +60,12 @@ public:
                  const cldnn::memory::ptr& hidden,
                  const cldnn::event::ptr& ready);
     void prefetch(const cldnn::primitive_inst* current_moe);
+    bool uses_predictor() const { return m_predictor != nullptr; }
     // Stores the layer input as the "previous token" half of its predictor head; a no-op without a predictor.
-    void update_previous(const cldnn::primitive_id& id, const cldnn::memory::ptr& hidden, const std::vector<cldnn::event::ptr>& ready);
+    void update_previous(const cldnn::primitive_id& id,
+                         const cldnn::memory::ptr& hidden,
+                         const cldnn::layout& hidden_layout,
+                         const std::vector<cldnn::event::ptr>& ready);
 
 private:
     LesPredictor::Head* predictor_head(const cldnn::primitive_id& id);

@@ -8,8 +8,10 @@
 #include <array>
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -23,16 +25,26 @@ namespace ov::intel_gpu::ocl::moe_otd {
 cldnn::stream::ptr create_copy_stream(cldnn::engine& engine, const cldnn::ExecutionConfig& config);
 
 struct LesSpeculationPolicy {
-    static constexpr size_t lookahead_layers = 1;
-    static constexpr size_t predict_k = 4;
-    static constexpr size_t max_experts = 4;
-    static constexpr size_t max_bytes = 16 * 1024 * 1024;
+    static constexpr size_t max_bytes = 32 * 1024 * 1024;
 
-    static size_t expert_budget(size_t capacity, size_t expert_bytes) {
-        if (capacity <= 1 || expert_bytes == 0) {
+    // Speculative loads may only use the slots that the layer's own top_k demand does not need.
+    // MOE_LES_PREFETCH_EXPERTS overrides the limit for experiments (0 disables prefetch).
+    static size_t expert_budget(size_t capacity, size_t expert_bytes, size_t top_k) {
+        if (expert_bytes == 0 || capacity <= top_k) {
             return 0;
         }
-        return std::min({max_experts, std::max<size_t>(1, capacity / 4), max_bytes / expert_bytes});
+        const size_t spare = capacity - top_k;
+        static const std::optional<size_t> forced = [] () -> std::optional<size_t> {
+            const auto* value = std::getenv("MOE_LES_PREFETCH_EXPERTS");
+            if (!value) {
+                return std::nullopt;
+            }
+            return static_cast<size_t>(std::strtoul(value, nullptr, 10));
+        }();
+        if (forced) {
+            return std::min(*forced, spare);
+        }
+        return std::min({top_k, spare, max_bytes / expert_bytes});
     }
 };
 

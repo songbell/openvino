@@ -888,16 +888,15 @@ TEST(moe_les_reservations, speculation_cannot_evict_active_demand_and_unused_slo
     EXPECT_TRUE(reservations.release(*replacement));
 }
 
-TEST(moe_les_reservations, fixed_speculative_policy_separates_horizon_rank_and_byte_budget) {
+TEST(moe_les_reservations, speculative_policy_uses_spare_slots_and_byte_budget) {
     using Policy = otd::LesSpeculationPolicy;
-    EXPECT_EQ(Policy::lookahead_layers, 1U);
-    EXPECT_EQ(Policy::predict_k, 4U);
-    EXPECT_EQ(Policy::expert_budget(1, 16), 0U);
-    EXPECT_EQ(Policy::expert_budget(16, 0), 0U);
-    EXPECT_EQ(Policy::expert_budget(16, 16), 4U);
-    EXPECT_EQ(Policy::expert_budget(4, 16), 1U);
-    EXPECT_EQ(Policy::expert_budget(16, Policy::max_bytes), 1U);
-    EXPECT_EQ(Policy::expert_budget(16, Policy::max_bytes + 1), 0U);
+    EXPECT_EQ(Policy::expert_budget(16, 0, 8), 0U);
+    EXPECT_EQ(Policy::expert_budget(8, 16, 8), 0U);
+    EXPECT_EQ(Policy::expert_budget(16, 16, 8), 8U);
+    EXPECT_EQ(Policy::expert_budget(12, 16, 8), 4U);
+    EXPECT_EQ(Policy::expert_budget(32, 16, 16), 16U);
+    EXPECT_EQ(Policy::expert_budget(32, Policy::max_bytes, 16), 1U);
+    EXPECT_EQ(Policy::expert_budget(32, Policy::max_bytes + 1, 16), 0U);
 }
 
 TEST(moe_les_reservations, rollback_unstarted_speculation_restores_full_cache) {

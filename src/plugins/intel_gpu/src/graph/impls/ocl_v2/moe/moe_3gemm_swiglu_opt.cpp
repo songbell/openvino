@@ -1740,13 +1740,13 @@ public:
         std::vector<uint32_t> experts;
         if (split_les) {
             stream.finish();
-        }
-        if (token_num == 1) {
+            // The routing ids are final here; the prediction is enqueued later, after the demand loads have started.
+            lookahead_enter(instance);
+        } else if (token_num == 1) {
             enqueue_lookahead_prediction(events, instance);
         }
         if (split_les) {
             experts.resize(token_num * static_cast<size_t>(max_topk));
-            stream.enqueue_barrier({stream.enqueue_marker({}, true)});
             scratch.topk_id->copy_to(stream, experts.data(), 0, 0, experts.size() * sizeof(uint32_t), true);
             for (auto expert : experts) {
                 OPENVINO_ASSERT(expert < static_cast<uint32_t>(cur_moe->_config.num_expert),
@@ -1896,6 +1896,7 @@ public:
                     auto demand_event = prefetcher.demand_async(*provider, missing_ids);
                     prefetcher.promote(*provider, wave_experts);
                     if (wave == 0) {
+                        enqueue_lookahead_prediction(events, instance, false);
                         _lookahead->prefetch(&instance);
                     }
                     std::vector<int32_t> slots(pair_count, 0);
@@ -3104,7 +3105,10 @@ public:
         auto& instance = reinterpret_cast<typed_primitive_inst<moe_3gemm_fused_compressed>&>(ins);
         bind_weights_on_first_exec(instance);
         _weight_provider = _lookahead->bind(ins.id(), _weight_provider);
-        _lookahead->update_previous(ins.id(), instance.input_memory_ptr(0), events);
+        {
+            auto [hidden_mem, hidden_layout] = get_input_info(instance, static_cast<size_t>(MOE3GemmInputIndex::HIDDEN_STATES));
+            _lookahead->update_previous(ins.id(), hidden_mem, hidden_layout, events);
+        }
         try {
             return execute_impl(events, ins);
         } catch (...) {
@@ -3113,20 +3117,39 @@ public:
         }
     }
 
-    void enqueue_lookahead_prediction(const std::vector<cldnn::event::ptr>& events, cldnn::primitive_inst& instance) {
-        if (_lookahead) {
-            auto& stream = instance.get_network().get_stream();
-            auto hidden = instance.input_memory_ptr(0);
-            const auto& layout = hidden->get_layout();
-            if (layout.data_type == data_types::f16 && layout.format == format::bfyx &&
-                layout.count() == layout.get_shape().back() && layout.get_linear_size() == layout.count()) {
-                _lookahead->enter(instance.id());
-                auto ready = stream.enqueue_marker(events, true);
-                if (const auto* next_layer = _lookahead->get_next_layer(&instance)) {
-                    _lookahead->predict(*next_layer, hidden, ready);
-                }
-                stream.enqueue_barrier({stream.enqueue_marker({}, true)});
-            }
+    cldnn::memory::ptr lookahead_hidden(cldnn::primitive_inst& instance) {
+        if (!_lookahead) {
+            return nullptr;
+        }
+        auto hidden = instance.input_memory_ptr(0);
+        const auto& layout = hidden->get_layout();
+        const bool single_token = layout.data_type == data_types::f16 && layout.format == format::bfyx &&
+                                  layout.count() == layout.get_shape().back() && layout.get_linear_size() == layout.count();
+        return single_token ? hidden : nullptr;
+    }
+
+    void lookahead_enter(cldnn::primitive_inst& instance) {
+        if (lookahead_hidden(instance)) {
+            _lookahead->enter(instance.id());
+        }
+    }
+
+    void enqueue_lookahead_prediction(const std::vector<cldnn::event::ptr>& events, cldnn::primitive_inst& instance, bool enter = true) {
+        auto hidden = lookahead_hidden(instance);
+        if (!hidden) {
+            return;
+        }
+        auto& stream = instance.get_network().get_stream();
+        if (enter) {
+            _lookahead->enter(instance.id());
+        }
+        auto ready = stream.enqueue_marker(events, true);
+        if (const auto* next_layer = _lookahead->get_next_layer(&instance)) {
+            _lookahead->predict(*next_layer, hidden, ready);
+        }
+        // A predictor head reads a private copy of the hidden input, so only the next-layer router path needs the full drain.
+        if (!_lookahead->uses_predictor()) {
+            stream.enqueue_barrier({stream.enqueue_marker({}, true)});
         }
     }
 

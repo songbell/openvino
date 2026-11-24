@@ -94,7 +94,8 @@ public:
                                                   top_k * sizeof(uint32_t), false, &wait_list, &readback);
             wait_list = {readback};
             cl::Event complete;
-            queue.enqueueBarrierWithWaitList(&wait_list, &complete);
+            // A marker only signals completion; a barrier here would stall every later command behind the predictor.
+            queue.enqueueMarkerWithWaitList(&wait_list, &complete);
             auto completed = std::make_shared<cldnn::ocl::ocl_event>(complete);
             m_pending.push_back({completed, cpu_indices});
             return {m_indices, m_weights, completed, std::move(cpu_indices)};

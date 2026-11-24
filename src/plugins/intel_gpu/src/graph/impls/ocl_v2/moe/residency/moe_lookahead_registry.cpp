@@ -185,15 +185,15 @@ LesPredictor::Head* LookaheadContext::predictor_head(const cldnn::primitive_id& 
 
 void LookaheadContext::update_previous(const cldnn::primitive_id& id,
                                        const cldnn::memory::ptr& hidden,
+                                       const cldnn::layout& layout,
                                        const std::vector<cldnn::event::ptr>& ready) {
     auto* head = predictor_head(id);
     if (!head || !hidden) {
         return;
     }
-    const auto& layout = hidden->get_layout();
     const size_t row_bytes = size_t{head->hidden} * sizeof(ov::float16);
     if (layout.data_type != cldnn::data_types::f16 || layout.format != cldnn::format::bfyx || layout.get_linear_size() != layout.count() ||
-        layout.count() < head->hidden || layout.count() % head->hidden != 0) {
+        layout.count() < head->hidden || layout.count() % head->hidden != 0 || layout.count() * sizeof(ov::float16) > hidden->size()) {
         GPU_DEBUG_INFO << "LES predictor: cannot keep the previous-token input of " << id << " for layout " << layout.to_short_string() << std::endl;
         return;
     }
@@ -206,7 +206,9 @@ void LookaheadContext::update_previous(const cldnn::primitive_id& id,
     auto& stream = m_network.get_stream();
     stream.enqueue_barrier(dependencies);
     // The last row is the newest token of a prefill chunk.
-    head->input->copy_from(stream, *hidden, layout.count() * sizeof(ov::float16) - row_bytes, row_bytes, row_bytes, false);
+    const auto copied = head->input->copy_from(stream, *hidden, layout.count() * sizeof(ov::float16) - row_bytes, row_bytes, row_bytes, false);
+    // Later commands may reuse the hidden buffer or overwrite this half again, so they must wait for the copy.
+    stream.enqueue_barrier({copied});
 }
 
 void LookaheadContext::prefetch(const cldnn::primitive_inst* current_moe) {
