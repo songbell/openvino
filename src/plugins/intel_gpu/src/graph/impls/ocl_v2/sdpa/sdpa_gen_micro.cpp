@@ -1552,6 +1552,7 @@ JitConstants SDPAMicroGenerator::get_jit_constants(const kernel_impl_params& par
         jit.make("PREFETCH_K0", enable_k_prefetch);
         jit.make("PREFETCH_K", enable_k_prefetch);
         jit.make("PREFETCH_V", enable_kv_prefetch && ((disabled_prefetch & 4) == 0));
+        jit.make("PA_PREFETCH_NEXT", (disabled_prefetch & 8) == 0);
         bool no_rem = d_full && v_full && k_full;
         jit.make("PREFETCH_REMAINDER", !no_rem);
         jit.make("PREFETCH_D_MAX", std::min<int64_t>(d_max, 64));

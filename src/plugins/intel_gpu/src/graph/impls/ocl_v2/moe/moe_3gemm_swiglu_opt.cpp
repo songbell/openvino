@@ -3104,6 +3104,7 @@ public:
         auto& instance = reinterpret_cast<typed_primitive_inst<moe_3gemm_fused_compressed>&>(ins);
         bind_weights_on_first_exec(instance);
         _weight_provider = _lookahead->bind(ins.id(), _weight_provider);
+        _lookahead->update_previous(ins.id(), instance.input_memory_ptr(0), events);
         try {
             return execute_impl(events, ins);
         } catch (...) {

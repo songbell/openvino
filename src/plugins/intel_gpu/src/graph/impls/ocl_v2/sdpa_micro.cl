@@ -778,6 +778,33 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
 #endif
         bool last = (k0 + k_chunk >= causal_k);
 
+#if PA_PREFETCH_NEXT && IS_PAGED_ATTENTION && !IS_PREFILL && !IS_GQA_SINGLE_TOKEN && !MICRO_CHUNKED_KV && IS_KV_COMPRESSED_PA
+        // Paged K/V have no linear layout for the generic prefetch, so prefetch next chunk's pages through the page table.
+        {
+            const int nk0 = k0 + ugemm_kq_wg_tile_m;
+            if (!last && nk0 < past_len) {
+                const uint pf_pages = ugemm_kq_wg_tile_m / PAGED_ATTENTION_BLOCK_SIZE;
+                const uint lane = get_sub_group_local_id();
+                for (uint t = sg_ij; t < 2 * pf_pages; t += sg_per_wg) {
+                    const bool is_v = t >= pf_pages;
+                    const uint slot = is_v ? t - pf_pages : t;
+                    if (nk0 + (int)(slot * PAGED_ATTENTION_BLOCK_SIZE) >= past_len)
+                        continue;
+                    const uint pg = block_indices[base_block_index + (uint)(nk0 / PAGED_ATTENTION_BLOCK_SIZE) + slot];
+                    if (!is_v) {
+                        const global uchar *pk = (const global uchar *)(K + (size_t)KV_HEADS_NUM * ADJUSTED_K_HEAD_SIZE * ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE * pg);
+                        for (uint off = lane * 64; off < ADJUSTED_K_HEAD_SIZE * ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE; off += SUBGROUP_SIZE * 64)
+                            __builtin_IB_lsc_prefetch_global_uint((const global uint *)(pk + off), 0, LSC_LDCC_L1C_L3C);
+                    } else {
+                        const global uchar *pv = (const global uchar *)(V + (size_t)KV_HEADS_NUM * ADJUSTED_V_HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE * pg);
+                        for (uint off = lane * 64; off < ADJUSTED_V_HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE; off += SUBGROUP_SIZE * 64)
+                            __builtin_IB_lsc_prefetch_global_uint((const global uint *)(pv + off), 0, LSC_LDCC_L1C_L3C);
+                    }
+                }
+            }
+        }
+#endif
+
         uint sg_i0_kq = sg_i_kq * ugemm_kq_sg_tile_m;
         uint sg_j0_kq = sg_j_kq * ugemm_kq_sg_tile_n;
 
